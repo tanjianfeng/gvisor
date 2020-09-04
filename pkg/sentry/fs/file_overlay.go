@@ -15,14 +15,15 @@
 package fs
 
 import (
-	"sync"
+	"io"
 
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/context"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
-	"gvisor.dev/gvisor/pkg/sentry/usermem"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -53,7 +54,7 @@ func overlayFile(ctx context.Context, inode *Inode, flags FileFlags) (*File, err
 	// Drop the extra reference on the Dirent. Now there's only one reference
 	// on the dirent, either owned by f (if non-nil), or the Dirent is about
 	// to be destroyed (if GetFile failed).
-	dirent.DecRef()
+	dirent.DecRef(ctx)
 
 	return f, err
 }
@@ -88,12 +89,12 @@ type overlayFileOperations struct {
 }
 
 // Release implements FileOperations.Release.
-func (f *overlayFileOperations) Release() {
+func (f *overlayFileOperations) Release(ctx context.Context) {
 	if f.upper != nil {
-		f.upper.DecRef()
+		f.upper.DecRef(ctx)
 	}
 	if f.lower != nil {
-		f.lower.DecRef()
+		f.lower.DecRef(ctx)
 	}
 }
 
@@ -163,7 +164,7 @@ func (f *overlayFileOperations) Seek(ctx context.Context, file *File, whence See
 func (f *overlayFileOperations) Readdir(ctx context.Context, file *File, serializer DentrySerializer) (int64, error) {
 	root := RootFromContext(ctx)
 	if root != nil {
-		defer root.DecRef()
+		defer root.DecRef(ctx)
 	}
 
 	dirCtx := &DirCtx{
@@ -268,9 +269,9 @@ func (f *overlayFileOperations) Read(ctx context.Context, file *File, dst userme
 }
 
 // WriteTo implements FileOperations.WriteTo.
-func (f *overlayFileOperations) WriteTo(ctx context.Context, file *File, dst *File, opts SpliceOpts) (n int64, err error) {
+func (f *overlayFileOperations) WriteTo(ctx context.Context, file *File, dst io.Writer, count int64, dup bool) (n int64, err error) {
 	err = f.onTop(ctx, file, func(file *File, ops FileOperations) error {
-		n, err = ops.WriteTo(ctx, file, dst, opts)
+		n, err = ops.WriteTo(ctx, file, dst, count, dup)
 		return err // Will overwrite itself.
 	})
 	return
@@ -285,9 +286,9 @@ func (f *overlayFileOperations) Write(ctx context.Context, file *File, src userm
 }
 
 // ReadFrom implements FileOperations.ReadFrom.
-func (f *overlayFileOperations) ReadFrom(ctx context.Context, file *File, src *File, opts SpliceOpts) (n int64, err error) {
+func (f *overlayFileOperations) ReadFrom(ctx context.Context, file *File, src io.Reader, count int64) (n int64, err error) {
 	// See above; f.upper must be non-nil.
-	return f.upper.FileOperations.ReadFrom(ctx, f.upper, src, opts)
+	return f.upper.FileOperations.ReadFrom(ctx, f.upper, src, count)
 }
 
 // Fsync implements FileOperations.Fsync.
@@ -474,7 +475,7 @@ func readdirEntries(ctx context.Context, o *overlayEntry) (*SortedDentryMap, err
 			// Skip this name if it is a negative entry in the
 			// upper or there exists a whiteout for it.
 			if o.upper != nil {
-				if overlayHasWhiteout(o.upper, name) {
+				if overlayHasWhiteout(ctx, o.upper, name) {
 					continue
 				}
 			}
@@ -496,7 +497,7 @@ func readdirOne(ctx context.Context, d *Dirent) (map[string]DentAttr, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer dir.DecRef()
+	defer dir.DecRef(ctx)
 
 	// Use a stub serializer to read the entries into memory.
 	stubSerializer := &CollectEntriesSerializer{}
@@ -520,10 +521,10 @@ type overlayMappingIdentity struct {
 }
 
 // DecRef implements AtomicRefCount.DecRef.
-func (omi *overlayMappingIdentity) DecRef() {
-	omi.AtomicRefCount.DecRefWithDestructor(func() {
-		omi.overlayFile.DecRef()
-		omi.id.DecRef()
+func (omi *overlayMappingIdentity) DecRef(ctx context.Context) {
+	omi.AtomicRefCount.DecRefWithDestructor(ctx, func(context.Context) {
+		omi.overlayFile.DecRef(ctx)
+		omi.id.DecRef(ctx)
 	})
 }
 
@@ -543,7 +544,7 @@ func (omi *overlayMappingIdentity) InodeID() uint64 {
 func (omi *overlayMappingIdentity) MappedName(ctx context.Context) string {
 	root := RootFromContext(ctx)
 	if root != nil {
-		defer root.DecRef()
+		defer root.DecRef(ctx)
 	}
 	name, _ := omi.overlayFile.Dirent.FullName(root)
 	return name

@@ -15,12 +15,14 @@
 package fsutil
 
 import (
+	"io"
+
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/context"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
-	"gvisor.dev/gvisor/pkg/sentry/usermem"
 	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -29,7 +31,7 @@ import (
 type FileNoopRelease struct{}
 
 // Release is a no-op.
-func (FileNoopRelease) Release() {}
+func (FileNoopRelease) Release(context.Context) {}
 
 // SeekWithDirCursor is used to implement fs.FileOperations.Seek.  If dirCursor
 // is not nil and the seek was on a directory, the cursor will be updated.
@@ -228,12 +230,12 @@ func (FileNoIoctl) Ioctl(context.Context, *fs.File, usermem.IO, arch.SyscallArgu
 type FileNoSplice struct{}
 
 // WriteTo implements fs.FileOperations.WriteTo.
-func (FileNoSplice) WriteTo(context.Context, *fs.File, *fs.File, fs.SpliceOpts) (int64, error) {
+func (FileNoSplice) WriteTo(context.Context, *fs.File, io.Writer, int64, bool) (int64, error) {
 	return 0, syserror.ENOSYS
 }
 
 // ReadFrom implements fs.FileOperations.ReadFrom.
-func (FileNoSplice) ReadFrom(context.Context, *fs.File, *fs.File, fs.SpliceOpts) (int64, error) {
+func (FileNoSplice) ReadFrom(context.Context, *fs.File, io.Reader, int64) (int64, error) {
 	return 0, syserror.ENOSYS
 }
 
@@ -294,7 +296,7 @@ func (sdfo *StaticDirFileOperations) IterateDir(ctx context.Context, d *fs.Diren
 func (sdfo *StaticDirFileOperations) Readdir(ctx context.Context, file *fs.File, serializer fs.DentrySerializer) (int64, error) {
 	root := fs.RootFromContext(ctx)
 	if root != nil {
-		defer root.DecRef()
+		defer root.DecRef(ctx)
 	}
 	dirCtx := &fs.DirCtx{
 		Serializer: serializer,

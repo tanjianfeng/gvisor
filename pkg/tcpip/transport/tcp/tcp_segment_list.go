@@ -1,20 +1,5 @@
 package tcp
 
-// ElementMapper provides an identity mapping by default.
-//
-// This can be replaced to provide a struct that maps elements to linker
-// objects, if they are not the same. An ElementMapper is not typically
-// required if: Linker is left as is, Element is left as is, or Linker and
-// Element are the same type.
-type segmentElementMapper struct{}
-
-// linkerFor maps an Element to a Linker.
-//
-// This default implementation should be inlined.
-//
-//go:nosplit
-func (segmentElementMapper) linkerFor(elem *segment) *segment { return elem }
-
 // List is an intrusive list. Entries can be added to or removed from the list
 // in O(1) time and with no additional memory allocations.
 //
@@ -52,13 +37,23 @@ func (l *segmentList) Back() *segment {
 	return l.tail
 }
 
+// Len returns the number of elements in the list.
+//
+// NOTE: This is an O(n) operation.
+func (l *segmentList) Len() (count int) {
+	for e := l.Front(); e != nil; e = (segmentMapper{}.linkerFor(e)).Next() {
+		count++
+	}
+	return count
+}
+
 // PushFront inserts the element e at the front of list l.
 func (l *segmentList) PushFront(e *segment) {
-	segmentElementMapper{}.linkerFor(e).SetNext(l.head)
-	segmentElementMapper{}.linkerFor(e).SetPrev(nil)
-
+	linker := segmentMapper{}.linkerFor(e)
+	linker.SetNext(l.head)
+	linker.SetPrev(nil)
 	if l.head != nil {
-		segmentElementMapper{}.linkerFor(l.head).SetPrev(e)
+		segmentMapper{}.linkerFor(l.head).SetPrev(e)
 	} else {
 		l.tail = e
 	}
@@ -68,11 +63,11 @@ func (l *segmentList) PushFront(e *segment) {
 
 // PushBack inserts the element e at the back of list l.
 func (l *segmentList) PushBack(e *segment) {
-	segmentElementMapper{}.linkerFor(e).SetNext(nil)
-	segmentElementMapper{}.linkerFor(e).SetPrev(l.tail)
-
+	linker := segmentMapper{}.linkerFor(e)
+	linker.SetNext(nil)
+	linker.SetPrev(l.tail)
 	if l.tail != nil {
-		segmentElementMapper{}.linkerFor(l.tail).SetNext(e)
+		segmentMapper{}.linkerFor(l.tail).SetNext(e)
 	} else {
 		l.head = e
 	}
@@ -86,25 +81,28 @@ func (l *segmentList) PushBackList(m *segmentList) {
 		l.head = m.head
 		l.tail = m.tail
 	} else if m.head != nil {
-		segmentElementMapper{}.linkerFor(l.tail).SetNext(m.head)
-		segmentElementMapper{}.linkerFor(m.head).SetPrev(l.tail)
+		segmentMapper{}.linkerFor(l.tail).SetNext(m.head)
+		segmentMapper{}.linkerFor(m.head).SetPrev(l.tail)
 
 		l.tail = m.tail
 	}
-
 	m.head = nil
 	m.tail = nil
 }
 
 // InsertAfter inserts e after b.
 func (l *segmentList) InsertAfter(b, e *segment) {
-	a := segmentElementMapper{}.linkerFor(b).Next()
-	segmentElementMapper{}.linkerFor(e).SetNext(a)
-	segmentElementMapper{}.linkerFor(e).SetPrev(b)
-	segmentElementMapper{}.linkerFor(b).SetNext(e)
+	bLinker := segmentMapper{}.linkerFor(b)
+	eLinker := segmentMapper{}.linkerFor(e)
+
+	a := bLinker.Next()
+
+	eLinker.SetNext(a)
+	eLinker.SetPrev(b)
+	bLinker.SetNext(e)
 
 	if a != nil {
-		segmentElementMapper{}.linkerFor(a).SetPrev(e)
+		segmentMapper{}.linkerFor(a).SetPrev(e)
 	} else {
 		l.tail = e
 	}
@@ -112,13 +110,16 @@ func (l *segmentList) InsertAfter(b, e *segment) {
 
 // InsertBefore inserts e before a.
 func (l *segmentList) InsertBefore(a, e *segment) {
-	b := segmentElementMapper{}.linkerFor(a).Prev()
-	segmentElementMapper{}.linkerFor(e).SetNext(a)
-	segmentElementMapper{}.linkerFor(e).SetPrev(b)
-	segmentElementMapper{}.linkerFor(a).SetPrev(e)
+	aLinker := segmentMapper{}.linkerFor(a)
+	eLinker := segmentMapper{}.linkerFor(e)
+
+	b := aLinker.Prev()
+	eLinker.SetNext(a)
+	eLinker.SetPrev(b)
+	aLinker.SetPrev(e)
 
 	if b != nil {
-		segmentElementMapper{}.linkerFor(b).SetNext(e)
+		segmentMapper{}.linkerFor(b).SetNext(e)
 	} else {
 		l.head = e
 	}
@@ -126,20 +127,24 @@ func (l *segmentList) InsertBefore(a, e *segment) {
 
 // Remove removes e from l.
 func (l *segmentList) Remove(e *segment) {
-	prev := segmentElementMapper{}.linkerFor(e).Prev()
-	next := segmentElementMapper{}.linkerFor(e).Next()
+	linker := segmentMapper{}.linkerFor(e)
+	prev := linker.Prev()
+	next := linker.Next()
 
 	if prev != nil {
-		segmentElementMapper{}.linkerFor(prev).SetNext(next)
-	} else {
+		segmentMapper{}.linkerFor(prev).SetNext(next)
+	} else if l.head == e {
 		l.head = next
 	}
 
 	if next != nil {
-		segmentElementMapper{}.linkerFor(next).SetPrev(prev)
-	} else {
+		segmentMapper{}.linkerFor(next).SetPrev(prev)
+	} else if l.tail == e {
 		l.tail = prev
 	}
+
+	linker.SetNext(nil)
+	linker.SetPrev(nil)
 }
 
 // Entry is a default implementation of Linker. Users can add anonymous fields

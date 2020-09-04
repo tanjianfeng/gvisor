@@ -26,8 +26,9 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	ucspb "gvisor.dev/gvisor/pkg/sentry/kernel/uncaught_signal_go_proto"
-	"gvisor.dev/gvisor/pkg/sentry/usermem"
 	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/usermem"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 // SignalAction is an internal signal action.
@@ -158,7 +159,7 @@ func (t *Task) deliverSignal(info *arch.SignalInfo, act arch.SignalAct) taskRunS
 	sigact := computeAction(linux.Signal(info.Signo), act)
 
 	if t.haveSyscallReturn {
-		if sre, ok := SyscallRestartErrnoFromReturn(t.Arch().Return()); ok {
+		if sre, ok := syserror.SyscallRestartErrnoFromReturn(t.Arch().Return()); ok {
 			// Signals that are ignored, cause a thread group stop, or
 			// terminate the thread group do not interact with interrupted
 			// syscalls; in Linux terms, they are never returned to the signal
@@ -167,13 +168,13 @@ func (t *Task) deliverSignal(info *arch.SignalInfo, act arch.SignalAct) taskRunS
 			// signal that is actually handled (by userspace).
 			if sigact == SignalActionHandler {
 				switch {
-				case sre == ERESTARTNOHAND:
+				case sre == syserror.ERESTARTNOHAND:
 					fallthrough
-				case sre == ERESTART_RESTARTBLOCK:
+				case sre == syserror.ERESTART_RESTARTBLOCK:
 					fallthrough
-				case (sre == ERESTARTSYS && !act.IsRestart()):
+				case (sre == syserror.ERESTARTSYS && !act.IsRestart()):
 					t.Debugf("Not restarting syscall %d after errno %d: interrupted by signal %d", t.Arch().SyscallNo(), sre, info.Signo)
-					t.Arch().SetReturn(uintptr(-t.ExtractErrno(syserror.EINTR, -1)))
+					t.Arch().SetReturn(uintptr(-ExtractErrno(syserror.EINTR, -1)))
 				default:
 					t.Debugf("Restarting syscall %d after errno %d: interrupted by signal %d", t.Arch().SyscallNo(), sre, info.Signo)
 					t.Arch().RestartSyscall()
@@ -254,17 +255,32 @@ func (t *Task) deliverSignalToHandler(info *arch.SignalInfo, act arch.SignalAct)
 		}
 	}
 
+	mm := t.MemoryManager()
 	// Set up the signal handler. If we have a saved signal mask, the signal
 	// handler should run with the current mask, but sigreturn should restore
 	// the saved one.
-	st := &arch.Stack{t.Arch(), t.MemoryManager(), sp}
+	st := &arch.Stack{t.Arch(), mm, sp}
 	mask := t.signalMask
 	if t.haveSavedSignalMask {
 		mask = t.savedSignalMask
 	}
+
+	// Set up the restorer.
+	// x86-64 should always uses SA_RESTORER, but this flag is optional on other platforms.
+	// Please see the linux code as reference:
+	// linux/arch/x86/kernel/signal.c:__setup_rt_frame()
+	// If SA_RESTORER is not configured, we can use the sigreturn trampolines
+	// the vdso provides instead.
+	// Please see the linux code as reference:
+	// linux/arch/arm64/kernel/signal.c:setup_return()
+	if act.Flags&linux.SA_RESTORER == 0 {
+		act.Restorer = mm.VDSOSigReturn()
+	}
+
 	if err := t.Arch().SignalSetup(st, &act, info, &alt, mask); err != nil {
 		return err
 	}
+	t.p.FullStateChanged()
 	t.haveSavedSignalMask = false
 
 	// Add our signal mask.
@@ -296,14 +312,16 @@ func (t *Task) SignalReturn(rt bool) (*SyscallControl, error) {
 
 	// Restore our signal mask. SIGKILL and SIGSTOP should not be blocked.
 	t.SetSignalMask(sigset &^ UnblockableSignals)
+	t.p.FullStateChanged()
 
 	return ctrlResume, nil
 }
 
 // Sigtimedwait implements the semantics of sigtimedwait(2).
 //
-// Preconditions: The caller must be running on the task goroutine. t.exitState
-// < TaskExitZombie.
+// Preconditions:
+// * The caller must be running on the task goroutine.
+// * t.exitState < TaskExitZombie.
 func (t *Task) Sigtimedwait(set linux.SignalSet, timeout time.Duration) (*arch.SignalInfo, error) {
 	// set is the set of signals we're interested in; invert it to get the set
 	// of signals to block.
@@ -497,6 +515,9 @@ func (tg *ThreadGroup) applySignalSideEffectsLocked(sig linux.Signal) {
 //
 // Preconditions: The signal mutex must be locked.
 func (t *Task) canReceiveSignalLocked(sig linux.Signal) bool {
+	// Notify that the signal is queued.
+	t.signalQueue.Notify(waiter.EventMask(linux.MakeSignalSet(sig)))
+
 	// - Do not choose tasks that are blocking the signal.
 	if linux.SignalSetOf(sig)&t.signalMask != 0 {
 		return false
@@ -509,8 +530,6 @@ func (t *Task) canReceiveSignalLocked(sig linux.Signal) bool {
 	if t.stop != nil {
 		return false
 	}
-	// - TODO(b/38173783): No special case for when t is also the sending task,
-	// because the identity of the sender is unknown.
 	// - Do not choose tasks that have already been interrupted, as they may be
 	// busy handling another signal.
 	if len(t.interruptChan) != 0 {
@@ -566,8 +585,9 @@ func (t *Task) SignalMask() linux.SignalSet {
 
 // SetSignalMask sets t's signal mask.
 //
-// Preconditions: SetSignalMask can only be called by the task goroutine.
-// t.exitState < TaskExitZombie.
+// Preconditions:
+// * The caller must be running on the task goroutine.
+// * t.exitState < TaskExitZombie.
 func (t *Task) SetSignalMask(mask linux.SignalSet) {
 	// By precondition, t prevents t.tg from completing an execve and mutating
 	// t.tg.signalHandlers, so we can skip the TaskSet mutex.
@@ -613,7 +633,7 @@ func (t *Task) setSignalMaskLocked(mask linux.SignalSet) {
 // SetSavedSignalMask sets the saved signal mask (see Task.savedSignalMask's
 // comment).
 //
-// Preconditions: SetSavedSignalMask can only be called by the task goroutine.
+// Preconditions: The caller must be running on the task goroutine.
 func (t *Task) SetSavedSignalMask(mask linux.SignalSet) {
 	t.savedSignalMask = mask
 	t.haveSavedSignalMask = true
@@ -621,6 +641,7 @@ func (t *Task) SetSavedSignalMask(mask linux.SignalSet) {
 
 // SignalStack returns the task-private signal stack.
 func (t *Task) SignalStack() arch.SignalStack {
+	t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch())
 	alt := t.signalStack
 	if t.onSignalStack(alt) {
 		alt.Flags |= arch.SignalStackFlagOnStack
@@ -701,7 +722,7 @@ func (tg *ThreadGroup) SetSignalAct(sig linux.Signal, actptr *arch.SignalAct) (a
 func (t *Task) CopyOutSignalAct(addr usermem.Addr, s *arch.SignalAct) error {
 	n := t.Arch().NewSignalAct()
 	n.SerializeFrom(s)
-	_, err := t.CopyOut(addr, n)
+	_, err := n.CopyOut(t, addr)
 	return err
 }
 
@@ -710,7 +731,7 @@ func (t *Task) CopyOutSignalAct(addr usermem.Addr, s *arch.SignalAct) error {
 func (t *Task) CopyInSignalAct(addr usermem.Addr) (arch.SignalAct, error) {
 	n := t.Arch().NewSignalAct()
 	var s arch.SignalAct
-	if _, err := t.CopyIn(addr, n); err != nil {
+	if _, err := n.CopyIn(t, addr); err != nil {
 		return s, err
 	}
 	n.DeserializeTo(&s)
@@ -722,7 +743,7 @@ func (t *Task) CopyInSignalAct(addr usermem.Addr) (arch.SignalAct, error) {
 func (t *Task) CopyOutSignalStack(addr usermem.Addr, s *arch.SignalStack) error {
 	n := t.Arch().NewSignalStack()
 	n.SerializeFrom(s)
-	_, err := t.CopyOut(addr, n)
+	_, err := n.CopyOut(t, addr)
 	return err
 }
 
@@ -731,7 +752,7 @@ func (t *Task) CopyOutSignalStack(addr usermem.Addr, s *arch.SignalStack) error 
 func (t *Task) CopyInSignalStack(addr usermem.Addr) (arch.SignalStack, error) {
 	n := t.Arch().NewSignalStack()
 	var s arch.SignalStack
-	if _, err := t.CopyIn(addr, n); err != nil {
+	if _, err := n.CopyIn(t, addr); err != nil {
 		return s, err
 	}
 	n.DeserializeTo(&s)
@@ -1035,6 +1056,8 @@ func (*runInterrupt) execute(t *Task) taskRunState {
 
 	// Are there signals pending?
 	if info := t.dequeueSignalLocked(t.signalMask); info != nil {
+		t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch())
+
 		if linux.SignalSetOf(linux.Signal(info.Signo))&StopSignals != 0 {
 			// Indicate that we've dequeued a stop signal before unlocking the
 			// signal mutex; initiateGroupStop will check for races with
@@ -1107,4 +1130,18 @@ func (*runInterruptAfterSignalDeliveryStop) execute(t *Task) taskRunState {
 	act := t.tg.signalHandlers.dequeueAction(linux.Signal(info.Signo))
 	t.tg.signalHandlers.mu.Unlock()
 	return t.deliverSignal(info, act)
+}
+
+// SignalRegister registers a waiter for pending signals.
+func (t *Task) SignalRegister(e *waiter.Entry, mask waiter.EventMask) {
+	t.tg.signalHandlers.mu.Lock()
+	t.signalQueue.EventRegister(e, mask)
+	t.tg.signalHandlers.mu.Unlock()
+}
+
+// SignalUnregister unregisters a waiter for pending signals.
+func (t *Task) SignalUnregister(e *waiter.Entry) {
+	t.tg.signalHandlers.mu.Lock()
+	t.signalQueue.EventUnregister(e)
+	t.tg.signalHandlers.mu.Unlock()
 }

@@ -22,11 +22,11 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"flag"
 	"github.com/google/subcommands"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
-	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/container"
+	"gvisor.dev/gvisor/runsc/flag"
 )
 
 // List implements subcommands.Command for the "list" command for the "list" command.
@@ -63,7 +63,7 @@ func (l *List) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 		return subcommands.ExitUsageError
 	}
 
-	conf := args[0].(*boot.Config)
+	conf := args[0].(*config.Config)
 	ids, err := container.List(conf.RootDir)
 	if err != nil {
 		Fatalf("%v", err)

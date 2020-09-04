@@ -17,11 +17,14 @@ package p9
 import (
 	"io"
 	"runtime/debug"
-	"sync"
 	"sync/atomic"
 	"syscall"
 
+	"gvisor.dev/gvisor/pkg/fd"
+	"gvisor.dev/gvisor/pkg/fdchannel"
+	"gvisor.dev/gvisor/pkg/flipcall"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
 )
 
@@ -45,7 +48,6 @@ type Server struct {
 }
 
 // NewServer returns a new server.
-//
 func NewServer(attacher Attacher) *Server {
 	return &Server{
 		attacher: attacher,
@@ -57,12 +59,6 @@ func NewServer(attacher Attacher) *Server {
 type connState struct {
 	// server is the backing server.
 	server *Server
-
-	// sendMu is the send lock.
-	sendMu sync.Mutex
-
-	// conn is the connection.
-	conn *unet.Socket
 
 	// fids is the set of active FIDs.
 	//
@@ -85,14 +81,44 @@ type connState struct {
 	// version 0 implies 9P2000.L.
 	version uint32
 
-	// recvOkay indicates that a receive may start.
-	recvOkay chan bool
+	// pendingWg counts requests that are still being handled.
+	pendingWg sync.WaitGroup
 
-	// recvDone is signalled when a message is received.
-	recvDone chan error
+	// -- below relates to the legacy handler --
 
-	// sendDone is signalled when a send is finished.
-	sendDone chan error
+	// recvMu serializes receiving from conn.
+	recvMu sync.Mutex
+
+	// recvIdle is the number of goroutines in handleRequests() attempting to
+	// lock recvMu so that they can receive from conn. recvIdle is accessed
+	// using atomic memory operations.
+	recvIdle int32
+
+	// If recvShutdown is true, at least one goroutine has observed a
+	// connection error while receiving from conn, and all goroutines in
+	// handleRequests() should exit immediately. recvShutdown is protected by
+	// recvMu.
+	recvShutdown bool
+
+	// sendMu serializes sending to conn.
+	sendMu sync.Mutex
+
+	// conn is the connection used by the legacy transport.
+	conn *unet.Socket
+
+	// -- below relates to the flipcall handler --
+
+	// channelMu protects below.
+	channelMu sync.Mutex
+
+	// channelWg represents active workers.
+	channelWg sync.WaitGroup
+
+	// channelAlloc allocates channel memory.
+	channelAlloc *flipcall.PacketWindowAllocator
+
+	// channels are the set of initialized channels.
+	channels []*channel
 }
 
 // fidRef wraps a node and tracks references.
@@ -386,11 +412,122 @@ func (cs *connState) WaitTag(t Tag) {
 	<-ch
 }
 
-// handleRequest handles a single request.
+// initializeChannels initializes all channels.
 //
-// The recvDone channel is signaled when recv is done (with a error if
-// necessary). The sendDone channel is signaled with the result of the send.
-func (cs *connState) handleRequest() {
+// This is a no-op if channels are already initialized.
+func (cs *connState) initializeChannels() (err error) {
+	cs.channelMu.Lock()
+	defer cs.channelMu.Unlock()
+
+	// Initialize our channel allocator.
+	if cs.channelAlloc == nil {
+		alloc, err := flipcall.NewPacketWindowAllocator()
+		if err != nil {
+			return err
+		}
+		cs.channelAlloc = alloc
+	}
+
+	// Create all the channels.
+	for len(cs.channels) < channelsPerClient {
+		res := &channel{
+			done: make(chan struct{}),
+		}
+
+		res.desc, err = cs.channelAlloc.Allocate(channelSize)
+		if err != nil {
+			return err
+		}
+		if err := res.data.Init(flipcall.ServerSide, res.desc); err != nil {
+			return err
+		}
+
+		socks, err := fdchannel.NewConnectedSockets()
+		if err != nil {
+			res.data.Destroy() // Cleanup.
+			return err
+		}
+		res.fds.Init(socks[0])
+		res.client = fd.New(socks[1])
+
+		cs.channels = append(cs.channels, res)
+
+		// Start servicing the channel.
+		//
+		// When we call stop, we will close all the channels and these
+		// routines should finish. We need the wait group to ensure
+		// that active handlers are actually finished before cleanup.
+		cs.channelWg.Add(1)
+		go func() { // S/R-SAFE: Server side.
+			defer cs.channelWg.Done()
+			if err := res.service(cs); err != nil {
+				// Don't log flipcall.ShutdownErrors, which we expect to be
+				// returned during server shutdown.
+				if _, ok := err.(flipcall.ShutdownError); !ok {
+					log.Warningf("p9.channel.service: %v", err)
+				}
+			}
+		}()
+	}
+
+	return nil
+}
+
+// lookupChannel looks up the channel with given id.
+//
+// The function returns nil if no such channel is available.
+func (cs *connState) lookupChannel(id uint32) *channel {
+	cs.channelMu.Lock()
+	defer cs.channelMu.Unlock()
+	if id >= uint32(len(cs.channels)) {
+		return nil
+	}
+	return cs.channels[id]
+}
+
+// handle handles a single message.
+func (cs *connState) handle(m message) (r message) {
+	cs.pendingWg.Add(1)
+	defer func() {
+		cs.pendingWg.Done()
+		if r == nil {
+			// Don't allow a panic to propagate.
+			err := recover()
+
+			// Include a useful log message.
+			log.Warningf("panic in handler: %v\n%s", err, debug.Stack())
+
+			// Wrap in an EFAULT error; we don't really have a
+			// better way to describe this kind of error. It will
+			// usually manifest as a result of the test framework.
+			r = newErr(syscall.EFAULT)
+		}
+	}()
+	if handler, ok := m.(handler); ok {
+		// Call the message handler.
+		r = handler.handle(cs)
+	} else {
+		// Produce an ENOSYS error.
+		r = newErr(syscall.ENOSYS)
+	}
+	return
+}
+
+// handleRequest handles a single request. It returns true if the caller should
+// continue handling requests and false if it should terminate.
+func (cs *connState) handleRequest() bool {
+	// Obtain the right to receive a message from cs.conn.
+	atomic.AddInt32(&cs.recvIdle, 1)
+	cs.recvMu.Lock()
+	atomic.AddInt32(&cs.recvIdle, -1)
+
+	if cs.recvShutdown {
+		// Another goroutine already detected a connection problem; exit
+		// immediately.
+		cs.recvMu.Unlock()
+		return false
+	}
+
 	messageSize := atomic.LoadUint32(&cs.messageSize)
 	if messageSize == 0 {
 		// Default or not yet negotiated.
@@ -401,12 +538,17 @@ func (cs *connState) handleRequest() {
 	tag, m, err := recv(cs.conn, messageSize, msgRegistry.get)
 	if errSocket, ok := err.(ErrSocket); ok {
 		// Connection problem; stop serving.
-		cs.recvDone <- errSocket.error
-		return
+		log.Debugf("p9.recv: %v", errSocket.error)
+		cs.recvShutdown = true
+		cs.recvMu.Unlock()
+		return false
 	}
 
-	// Signal receive is done.
-	cs.recvDone <- nil
+	// Ensure that another goroutine is available to receive from cs.conn.
+	if atomic.LoadInt32(&cs.recvIdle) == 0 {
+		go cs.handleRequests() // S/R-SAFE: Irrelevant.
+	}
+	cs.recvMu.Unlock()
 
 	// Deal with other errors.
 	if err != nil && err != io.EOF {
@@ -415,142 +557,100 @@ func (cs *connState) handleRequest() {
 		cs.sendMu.Lock()
 		err := send(cs.conn, tag, newErr(err))
 		cs.sendMu.Unlock()
-		cs.sendDone <- err
-		return
+		if err != nil {
+			log.Debugf("p9.send: %v", err)
+		}
+		return true
 	}
 
 	// Try to start the tag.
 	if !cs.StartTag(tag) {
 		// Nothing we can do at this point; client is bogus.
 		log.Debugf("no valid tag [%05d]", tag)
-		cs.sendDone <- ErrNoValidMessage
-		return
+		return true
 	}
 
 	// Handle the message.
-	var r message // r is the response.
-	defer func() {
-		if r == nil {
-			// Don't allow a panic to propagate.
-			recover()
+	r := cs.handle(m)
 
-			// Include a useful log message.
-			log.Warningf("panic in handler: %s", debug.Stack())
+	// Clear the tag before sending. That's because as soon as this hits
+	// the wire, the client can legally send the same tag.
+	cs.ClearTag(tag)
 
-			// Wrap in an EFAULT error; we don't really have a
-			// better way to describe this kind of error. It will
-			// usually manifest as a result of the test framework.
-			r = newErr(syscall.EFAULT)
-		}
-
-		// Clear the tag before sending. That's because as soon as this
-		// hits the wire, the client can legally send another message
-		// with the same tag.
-		cs.ClearTag(tag)
-
-		// Send back the result.
-		cs.sendMu.Lock()
-		err = send(cs.conn, tag, r)
-		cs.sendMu.Unlock()
-		cs.sendDone <- err
-	}()
-	if handler, ok := m.(handler); ok {
-		// Call the message handler.
-		r = handler.handle(cs)
-	} else {
-		// Produce an ENOSYS error.
-		r = newErr(syscall.ENOSYS)
+	// Send back the result.
+	cs.sendMu.Lock()
+	err = send(cs.conn, tag, r)
+	cs.sendMu.Unlock()
+	if err != nil {
+		log.Debugf("p9.send: %v", err)
 	}
+
+	// Return the message to the cache.
 	msgRegistry.put(m)
-	m = nil // 'm' should not be touched after this point.
+
+	return true
 }
 
 func (cs *connState) handleRequests() {
-	for range cs.recvOkay {
-		cs.handleRequest()
+	for {
+		if !cs.handleRequest() {
+			return
+		}
 	}
 }
 
 func (cs *connState) stop() {
-	// Close all channels.
-	close(cs.recvOkay)
-	close(cs.recvDone)
-	close(cs.sendDone)
+	// Wait for completion of all inflight requests. This is mostly so that if
+	// a request is stuck, the sandbox supervisor has the opportunity to kill
+	// us with SIGABRT to get a stack dump of the offending handler.
+	cs.pendingWg.Wait()
 
-	for _, fidRef := range cs.fids {
-		// Drop final reference in the FID table. Note this should
-		// always close the file, since we've ensured that there are no
-		// handlers running via the wait for Pending => 0 below.
-		fidRef.DecRef()
+	// Free the channels.
+	cs.channelMu.Lock()
+	for _, ch := range cs.channels {
+		ch.Shutdown()
+	}
+	cs.channelWg.Wait()
+	for _, ch := range cs.channels {
+		ch.Close()
+	}
+	cs.channels = nil // Clear.
+	cs.channelMu.Unlock()
+
+	// Free the channel memory.
+	if cs.channelAlloc != nil {
+		cs.channelAlloc.Destroy()
 	}
 
 	// Ensure the connection is closed.
 	cs.conn.Close()
-}
 
-// service services requests concurrently.
-func (cs *connState) service() error {
-	// Pending is the number of handlers that have finished receiving but
-	// not finished processing requests. These must be waiting on properly
-	// below. See the next comment for an explanation of the loop.
-	pending := 0
+	// Close all remaining fids.
+	for fid, fidRef := range cs.fids {
+		delete(cs.fids, fid)
 
-	// Start the first request handler.
-	go cs.handleRequests() // S/R-SAFE: Irrelevant.
-	cs.recvOkay <- true
-
-	// We loop and make sure there's always one goroutine waiting for a new
-	// request. We process all the data for a single request in one
-	// goroutine however, to ensure the best turnaround time possible.
-	for {
-		select {
-		case err := <-cs.recvDone:
-			if err != nil {
-				// Wait for pending handlers.
-				for i := 0; i < pending; i++ {
-					<-cs.sendDone
-				}
-				return err
-			}
-
-			// This handler is now pending.
-			pending++
-
-			// Kick the next receiver, or start a new handler
-			// if no receiver is currently waiting.
-			select {
-			case cs.recvOkay <- true:
-			default:
-				go cs.handleRequests() // S/R-SAFE: Irrelevant.
-				cs.recvOkay <- true
-			}
-
-		case <-cs.sendDone:
-			// This handler is finished.
-			pending--
-
-			// Error sending a response? Nothing can be done.
-			//
-			// We don't terminate on a send error though, since
-			// we still have a pending receive. The error would
-			// have been logged above, we just ignore it here.
-		}
+		// Drop final reference in the FID table. Note this should
+		// always close the file, since we've ensured that there are no
+		// handlers running via the wait for Pending => 0 below.
+		fidRef.DecRef()
 	}
 }
 
 // Handle handles a single connection.
 func (s *Server) Handle(conn *unet.Socket) error {
 	cs := &connState{
-		server:   s,
-		conn:     conn,
-		fids:     make(map[FID]*fidRef),
-		tags:     make(map[Tag]chan struct{}),
-		recvOkay: make(chan bool),
-		recvDone: make(chan error, 10),
-		sendDone: make(chan error, 10),
+		server: s,
+		fids:   make(map[FID]*fidRef),
+		tags:   make(map[Tag]chan struct{}),
+		conn:   conn,
 	}
 	defer cs.stop()
-	return cs.service()
+
+	// Serve requests from conn in the current goroutine; handleRequests() will
+	// create more goroutines as needed.
+	cs.handleRequests()
+
+	return nil
 }
 
 // Serve handles requests from the bound socket.

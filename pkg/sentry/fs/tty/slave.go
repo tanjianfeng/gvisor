@@ -16,14 +16,16 @@ package tty
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/context"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/fs/fsutil"
-	"gvisor.dev/gvisor/pkg/sentry/usermem"
 	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
+
+// LINT.IfChange
 
 // slaveInodeOperations are the fs.InodeOperations for the slave end of the
 // Terminal (pts file).
@@ -69,7 +71,12 @@ func newSlaveInode(ctx context.Context, d *dirInodeOperations, t *Terminal, owne
 
 // Release implements fs.InodeOperations.Release.
 func (si *slaveInodeOperations) Release(ctx context.Context) {
-	si.t.DecRef()
+	si.t.DecRef(ctx)
+}
+
+// Truncate implements fs.InodeOperations.Truncate.
+func (*slaveInodeOperations) Truncate(context.Context, *fs.Inode, int64) error {
+	return nil
 }
 
 // GetFile implements fs.InodeOperations.GetFile.
@@ -99,7 +106,7 @@ type slaveFileOperations struct {
 var _ fs.FileOperations = (*slaveFileOperations)(nil)
 
 // Release implements fs.FileOperations.Release.
-func (sf *slaveFileOperations) Release() {
+func (sf *slaveFileOperations) Release(context.Context) {
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
@@ -152,11 +159,20 @@ func (sf *slaveFileOperations) Ioctl(ctx context.Context, _ *fs.File, io usermem
 	case linux.TIOCSCTTY:
 		// Make the given terminal the controlling terminal of the
 		// calling process.
-		// TODO(b/129283598): Implement once we have support for job
-		// control.
-		return 0, nil
+		return 0, sf.si.t.setControllingTTY(ctx, io, args, false /* isMaster */)
+	case linux.TIOCNOTTY:
+		// Release this process's controlling terminal.
+		return 0, sf.si.t.releaseControllingTTY(ctx, io, args, false /* isMaster */)
+	case linux.TIOCGPGRP:
+		// Get the foreground process group.
+		return sf.si.t.foregroundProcessGroup(ctx, io, args, false /* isMaster */)
+	case linux.TIOCSPGRP:
+		// Set the foreground process group.
+		return sf.si.t.setForegroundProcessGroup(ctx, io, args, false /* isMaster */)
 	default:
 		maybeEmitUnimplementedEvent(ctx, cmd)
 		return 0, syserror.ENOTTY
 	}
 }
+
+// LINT.ThenChange(../../fsimpl/devpts/slave.go)

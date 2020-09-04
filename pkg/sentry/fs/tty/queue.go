@@ -15,16 +15,17 @@
 package tty
 
 import (
-	"sync"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/context"
-	"gvisor.dev/gvisor/pkg/sentry/safemem"
-	"gvisor.dev/gvisor/pkg/sentry/usermem"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
+	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
+
+// LINT.IfChange
 
 // waitBufMaxBytes is the maximum size of a wait buffer. It is based on
 // TTYB_DEFAULT_MEM_LIMIT.
@@ -103,8 +104,7 @@ func (q *queue) readableSize(ctx context.Context, io usermem.IO, args arch.Sysca
 // as whether the read caused more readable data to become available (whether
 // data was pushed from the wait buffer to the read buffer).
 //
-// Preconditions:
-// * l.termiosMu must be held for reading.
+// Preconditions: l.termiosMu must be held for reading.
 func (q *queue) read(ctx context.Context, dst usermem.IOSequence, l *lineDiscipline) (int64, bool, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -144,8 +144,7 @@ func (q *queue) read(ctx context.Context, dst usermem.IOSequence, l *lineDiscipl
 
 // write writes to q from userspace.
 //
-// Preconditions:
-// * l.termiosMu must be held for reading.
+// Preconditions: l.termiosMu must be held for reading.
 func (q *queue) write(ctx context.Context, src usermem.IOSequence, l *lineDiscipline) (int64, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -187,8 +186,7 @@ func (q *queue) write(ctx context.Context, src usermem.IOSequence, l *lineDiscip
 
 // writeBytes writes to q from b.
 //
-// Preconditions:
-// * l.termiosMu must be held for reading.
+// Preconditions: l.termiosMu must be held for reading.
 func (q *queue) writeBytes(b []byte, l *lineDiscipline) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -198,16 +196,9 @@ func (q *queue) writeBytes(b []byte, l *lineDiscipline) {
 	q.pushWaitBufLocked(l)
 }
 
-// pushWaitBuf fills the queue's read buffer with data from the wait buffer.
+// pushWaitBufLocked fills the queue's read buffer with data from the wait
+// buffer.
 //
-// Preconditions:
-// * l.termiosMu must be held for reading.
-func (q *queue) pushWaitBuf(l *lineDiscipline) int {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.pushWaitBufLocked(l)
-}
-
 // Preconditions:
 // * l.termiosMu must be held for reading.
 // * q.mu must be locked.
@@ -242,3 +233,5 @@ func (q *queue) waitBufAppend(b []byte) {
 	q.waitBuf = append(q.waitBuf, b)
 	q.waitBufLen += uint64(len(b))
 }
+
+// LINT.ThenChange(../../fsimpl/devpts/queue.go)

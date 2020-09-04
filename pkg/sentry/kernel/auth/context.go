@@ -15,7 +15,7 @@
 package auth
 
 import (
-	"gvisor.dev/gvisor/pkg/sentry/context"
+	"gvisor.dev/gvisor/pkg/context"
 )
 
 // contextID is the auth package's type for context.Context.Value keys.
@@ -33,4 +33,24 @@ func CredentialsFromContext(ctx context.Context) *Credentials {
 		return v.(*Credentials)
 	}
 	return NewAnonymousCredentials()
+}
+
+// ContextWithCredentials returns a copy of ctx carrying creds.
+func ContextWithCredentials(ctx context.Context, creds *Credentials) context.Context {
+	return &authContext{ctx, creds}
+}
+
+type authContext struct {
+	context.Context
+	creds *Credentials
+}
+
+// Value implements context.Context.
+func (ac *authContext) Value(key interface{}) interface{} {
+	switch key {
+	case CtxCredentials:
+		return ac.creds
+	default:
+		return ac.Context.Value(key)
+	}
 }

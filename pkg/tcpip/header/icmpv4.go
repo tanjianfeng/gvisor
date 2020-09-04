@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 )
 
 // ICMPv4 represents an ICMPv4 header stored in a byte array.
@@ -25,17 +26,36 @@ type ICMPv4 []byte
 
 const (
 	// ICMPv4PayloadOffset defines the start of ICMP payload.
-	ICMPv4PayloadOffset = 4
+	ICMPv4PayloadOffset = 8
 
 	// ICMPv4MinimumSize is the minimum size of a valid ICMP packet.
 	ICMPv4MinimumSize = 8
 
 	// ICMPv4ProtocolNumber is the ICMP transport protocol number.
 	ICMPv4ProtocolNumber tcpip.TransportProtocolNumber = 1
+
+	// icmpv4ChecksumOffset is the offset of the checksum field
+	// in an ICMPv4 message.
+	icmpv4ChecksumOffset = 2
+
+	// icmpv4MTUOffset is the offset of the MTU field
+	// in a ICMPv4FragmentationNeeded message.
+	icmpv4MTUOffset = 6
+
+	// icmpv4IdentOffset is the offset of the ident field
+	// in a ICMPv4EchoRequest/Reply message.
+	icmpv4IdentOffset = 4
+
+	// icmpv4SequenceOffset is the offset of the sequence field
+	// in a ICMPv4EchoRequest/Reply message.
+	icmpv4SequenceOffset = 6
 )
 
 // ICMPv4Type is the ICMP type field described in RFC 792.
 type ICMPv4Type byte
+
+// ICMPv4Code is the ICMP code field described in RFC 792.
+type ICMPv4Code byte
 
 // Typical values of ICMPv4Type defined in RFC 792.
 const (
@@ -52,10 +72,13 @@ const (
 	ICMPv4InfoReply      ICMPv4Type = 16
 )
 
-// Values for ICMP code as defined in RFC 792.
+// ICMP codes for ICMPv4 Destination Unreachable messages as defined in RFC 792.
 const (
-	ICMPv4PortUnreachable     = 3
-	ICMPv4FragmentationNeeded = 4
+	ICMPv4TTLExceeded         ICMPv4Code = 0
+	ICMPv4HostUnreachable     ICMPv4Code = 1
+	ICMPv4ProtoUnreachable    ICMPv4Code = 2
+	ICMPv4PortUnreachable     ICMPv4Code = 3
+	ICMPv4FragmentationNeeded ICMPv4Code = 4
 )
 
 // Type is the ICMP type field.
@@ -65,19 +88,19 @@ func (b ICMPv4) Type() ICMPv4Type { return ICMPv4Type(b[0]) }
 func (b ICMPv4) SetType(t ICMPv4Type) { b[0] = byte(t) }
 
 // Code is the ICMP code field. Its meaning depends on the value of Type.
-func (b ICMPv4) Code() byte { return b[1] }
+func (b ICMPv4) Code() ICMPv4Code { return ICMPv4Code(b[1]) }
 
 // SetCode sets the ICMP code field.
-func (b ICMPv4) SetCode(c byte) { b[1] = c }
+func (b ICMPv4) SetCode(c ICMPv4Code) { b[1] = byte(c) }
 
 // Checksum is the ICMP checksum field.
 func (b ICMPv4) Checksum() uint16 {
-	return binary.BigEndian.Uint16(b[2:])
+	return binary.BigEndian.Uint16(b[icmpv4ChecksumOffset:])
 }
 
 // SetChecksum sets the ICMP checksum field.
 func (b ICMPv4) SetChecksum(checksum uint16) {
-	binary.BigEndian.PutUint16(b[2:], checksum)
+	binary.BigEndian.PutUint16(b[icmpv4ChecksumOffset:], checksum)
 }
 
 // SourcePort implements Transport.SourcePort.
@@ -101,4 +124,52 @@ func (ICMPv4) SetDestinationPort(uint16) {
 // Payload implements Transport.Payload.
 func (b ICMPv4) Payload() []byte {
 	return b[ICMPv4PayloadOffset:]
+}
+
+// MTU retrieves the MTU field from an ICMPv4 message.
+func (b ICMPv4) MTU() uint16 {
+	return binary.BigEndian.Uint16(b[icmpv4MTUOffset:])
+}
+
+// SetMTU sets the MTU field from an ICMPv4 message.
+func (b ICMPv4) SetMTU(mtu uint16) {
+	binary.BigEndian.PutUint16(b[icmpv4MTUOffset:], mtu)
+}
+
+// Ident retrieves the Ident field from an ICMPv4 message.
+func (b ICMPv4) Ident() uint16 {
+	return binary.BigEndian.Uint16(b[icmpv4IdentOffset:])
+}
+
+// SetIdent sets the Ident field from an ICMPv4 message.
+func (b ICMPv4) SetIdent(ident uint16) {
+	binary.BigEndian.PutUint16(b[icmpv4IdentOffset:], ident)
+}
+
+// Sequence retrieves the Sequence field from an ICMPv4 message.
+func (b ICMPv4) Sequence() uint16 {
+	return binary.BigEndian.Uint16(b[icmpv4SequenceOffset:])
+}
+
+// SetSequence sets the Sequence field from an ICMPv4 message.
+func (b ICMPv4) SetSequence(sequence uint16) {
+	binary.BigEndian.PutUint16(b[icmpv4SequenceOffset:], sequence)
+}
+
+// ICMPv4Checksum calculates the ICMP checksum over the provided ICMP header,
+// and payload.
+func ICMPv4Checksum(h ICMPv4, vv buffer.VectorisedView) uint16 {
+	// Calculate the IPv6 pseudo-header upper-layer checksum.
+	xsum := uint16(0)
+	for _, v := range vv.Views() {
+		xsum = Checksum(v, xsum)
+	}
+
+	// h[2:4] is the checksum itself, set it aside to avoid checksumming the checksum.
+	h2, h3 := h[2], h[3]
+	h[2], h[3] = 0, 0
+	xsum = ^Checksum(h, xsum)
+	h[2], h[3] = h2, h3
+
+	return xsum
 }

@@ -16,7 +16,7 @@ package transport
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/sentry/context"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -54,10 +54,10 @@ func (e *connectionlessEndpoint) isBound() bool {
 
 // Close puts the endpoint in a closed state and frees all resources associated
 // with it.
-func (e *connectionlessEndpoint) Close() {
+func (e *connectionlessEndpoint) Close(ctx context.Context) {
 	e.Lock()
 	if e.connected != nil {
-		e.connected.Release()
+		e.connected.Release(ctx)
 		e.connected = nil
 	}
 
@@ -71,7 +71,7 @@ func (e *connectionlessEndpoint) Close() {
 	e.Unlock()
 
 	r.CloseNotify()
-	r.Release()
+	r.Release(ctx)
 }
 
 // BidirectionalConnect implements BoundEndpoint.BidirectionalConnect.
@@ -99,7 +99,7 @@ func (e *connectionlessEndpoint) UnidirectionalConnect(ctx context.Context) (Con
 
 // SendMsg writes data and a control message to the specified endpoint.
 // This method does not block if the data cannot be written.
-func (e *connectionlessEndpoint) SendMsg(ctx context.Context, data [][]byte, c ControlMessages, to BoundEndpoint) (uintptr, *syserr.Error) {
+func (e *connectionlessEndpoint) SendMsg(ctx context.Context, data [][]byte, c ControlMessages, to BoundEndpoint) (int64, *syserr.Error) {
 	if to == nil {
 		return e.baseEndpoint.SendMsg(ctx, data, c, nil)
 	}
@@ -108,10 +108,10 @@ func (e *connectionlessEndpoint) SendMsg(ctx context.Context, data [][]byte, c C
 	if err != nil {
 		return 0, syserr.ErrInvalidEndpointState
 	}
-	defer connected.Release()
+	defer connected.Release(ctx)
 
 	e.Lock()
-	n, notify, err := connected.Send(data, c, tcpip.FullAddress{Addr: tcpip.Address(e.path)})
+	n, notify, err := connected.Send(ctx, data, c, tcpip.FullAddress{Addr: tcpip.Address(e.path)})
 	e.Unlock()
 
 	if notify {
@@ -135,7 +135,7 @@ func (e *connectionlessEndpoint) Connect(ctx context.Context, server BoundEndpoi
 
 	e.Lock()
 	if e.connected != nil {
-		e.connected.Release()
+		e.connected.Release(ctx)
 	}
 	e.connected = connected
 	e.Unlock()

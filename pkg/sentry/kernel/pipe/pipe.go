@@ -17,6 +17,7 @@ package pipe
 
 import (
 	"fmt"
+	"io"
 	"sync/atomic"
 	"syscall"
 
@@ -200,22 +201,22 @@ type readOps struct {
 //
 // Precondition: this pipe must have readers.
 func (p *Pipe) read(ctx context.Context, ops readOps) (int64, error) {
-	// Don't block for a zero-length read even if the pipe is empty.
-	if ops.left() == 0 {
-		return 0, nil
-	}
-
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.readLocked(ctx, ops)
 }
 
 func (p *Pipe) readLocked(ctx context.Context, ops readOps) (int64, error) {
+	// Don't block for a zero-length read even if the pipe is empty.
+	if ops.left() == 0 {
+		return 0, nil
+	}
+
 	// Is the pipe empty?
 	if p.view.Size() == 0 {
 		if !p.HasWriters() {
 			// There are no writers, return EOF.
-			return 0, nil
+			return 0, io.EOF
 		}
 		return 0, syserror.ErrWouldBlock
 	}
@@ -388,6 +389,10 @@ func (p *Pipe) rwReadiness() waiter.EventMask {
 func (p *Pipe) queued() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.queuedLocked()
+}
+
+func (p *Pipe) queuedLocked() int64 {
 	return p.view.Size()
 }
 

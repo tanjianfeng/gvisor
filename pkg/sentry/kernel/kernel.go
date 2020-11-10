@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/eventchannel"
@@ -220,13 +221,18 @@ type Kernel struct {
 	// danglingEndpoints is used to save / restore tcpip.DanglingEndpoints.
 	danglingEndpoints struct{} `state:".([]tcpip.Endpoint)"`
 
-	// sockets is the list of all network sockets the system. Protected by
-	// extMu.
+	// sockets is the list of all network sockets in the system.
+	// Protected by extMu.
+	// TODO(gvisor.dev/issue/1624): Only used by VFS1.
 	sockets socketList
 
-	// nextSocketEntry is the next entry number to use in sockets. Protected
+	// socketsVFS2 records all network sockets in the system. Protected by
+	// extMu.
+	socketsVFS2 map[*vfs.FileDescription]*SocketRecord
+
+	// nextSocketRecord is the next entry number to use in sockets. Protected
 	// by extMu.
-	nextSocketEntry uint64
+	nextSocketRecord uint64
 
 	// deviceRegistry is used to save/restore device.SimpleDevices.
 	deviceRegistry struct{} `state:".(*device.Registry)"`
@@ -248,7 +254,7 @@ type Kernel struct {
 	// SpecialOpts contains special kernel options.
 	SpecialOpts
 
-	// VFS keeps the filesystem state used across the kernel.
+	// vfs keeps the filesystem state used across the kernel.
 	vfs vfs.VirtualFilesystem
 
 	// hostMount is the Mount used for file descriptors that were imported
@@ -335,7 +341,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 		return fmt.Errorf("Timekeeper is nil")
 	}
 	if args.Timekeeper.clocks == nil {
-		return fmt.Errorf("Must call Timekeeper.SetClocks() before Kernel.Init()")
+		return fmt.Errorf("must call Timekeeper.SetClocks() before Kernel.Init()")
 	}
 	if args.RootUserNamespace == nil {
 		return fmt.Errorf("RootUserNamespace is nil")
@@ -360,7 +366,7 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 		k.useHostCores = true
 		maxCPU, err := hostcpu.MaxPossibleCPU()
 		if err != nil {
-			return fmt.Errorf("Failed to get maximum CPU number: %v", err)
+			return fmt.Errorf("failed to get maximum CPU number: %v", err)
 		}
 		minAppCores := uint(maxCPU) + 1
 		if k.applicationCores < minAppCores {
@@ -414,6 +420,8 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 			return fmt.Errorf("failed to create sockfs mount: %v", err)
 		}
 		k.socketMount = socketMount
+
+		k.socketsVFS2 = make(map[*vfs.FileDescription]*SocketRecord)
 	}
 
 	return nil
@@ -422,9 +430,8 @@ func (k *Kernel) Init(args InitKernelArgs) error {
 // SaveTo saves the state of k to w.
 //
 // Preconditions: The kernel must be paused throughout the call to SaveTo.
-func (k *Kernel) SaveTo(w wire.Writer) error {
+func (k *Kernel) SaveTo(ctx context.Context, w wire.Writer) error {
 	saveStart := time.Now()
-	ctx := k.SupervisorContext()
 
 	// Do not allow other Kernel methods to affect it while it's being saved.
 	k.extMu.Lock()
@@ -438,38 +445,55 @@ func (k *Kernel) SaveTo(w wire.Writer) error {
 	k.mf.StartEvictions()
 	k.mf.WaitForEvictions()
 
-	// Flush write operations on open files so data reaches backing storage.
-	// This must come after MemoryFile eviction since eviction may cause file
-	// writes.
-	if err := k.tasks.flushWritesToFiles(ctx); err != nil {
-		return err
-	}
+	if VFS2Enabled {
+		// Discard unsavable mappings, such as those for host file descriptors.
+		if err := k.invalidateUnsavableMappings(ctx); err != nil {
+			return fmt.Errorf("failed to invalidate unsavable mappings: %v", err)
+		}
 
-	// Remove all epoll waiter objects from underlying wait queues.
-	// NOTE: for programs to resume execution in future snapshot scenarios,
-	// we will need to re-establish these waiter objects after saving.
-	k.tasks.unregisterEpollWaiters(ctx)
+		// Prepare filesystems for saving. This must be done after
+		// invalidateUnsavableMappings(), since dropping memory mappings may
+		// affect filesystem state (e.g. page cache reference counts).
+		if err := k.vfs.PrepareSave(ctx); err != nil {
+			return err
+		}
+	} else {
+		// Flush cached file writes to backing storage. This must come after
+		// MemoryFile eviction since eviction may cause file writes.
+		if err := k.flushWritesToFiles(ctx); err != nil {
+			return err
+		}
 
-	// Clear the dirent cache before saving because Dirents must be Loaded in a
-	// particular order (parents before children), and Loading dirents from a cache
-	// breaks that order.
-	if err := k.flushMountSourceRefs(ctx); err != nil {
-		return err
-	}
+		// Remove all epoll waiter objects from underlying wait queues.
+		// NOTE: for programs to resume execution in future snapshot scenarios,
+		// we will need to re-establish these waiter objects after saving.
+		k.tasks.unregisterEpollWaiters(ctx)
 
-	// Ensure that all inode and mount release operations have completed.
-	fs.AsyncBarrier()
+		// Clear the dirent cache before saving because Dirents must be Loaded in a
+		// particular order (parents before children), and Loading dirents from a cache
+		// breaks that order.
+		if err := k.flushMountSourceRefs(ctx); err != nil {
+			return err
+		}
 
-	// Once all fs work has completed (flushed references have all been released),
-	// reset mount mappings. This allows individual mounts to save how inodes map
-	// to filesystem resources. Without this, fs.Inodes cannot be restored.
-	fs.SaveInodeMappings()
+		// Ensure that all inode and mount release operations have completed.
+		fs.AsyncBarrier()
 
-	// Discard unsavable mappings, such as those for host file descriptors.
-	// This must be done after waiting for "asynchronous fs work", which
-	// includes async I/O that may touch application memory.
-	if err := k.invalidateUnsavableMappings(ctx); err != nil {
-		return fmt.Errorf("failed to invalidate unsavable mappings: %v", err)
+		// Once all fs work has completed (flushed references have all been released),
+		// reset mount mappings. This allows individual mounts to save how inodes map
+		// to filesystem resources. Without this, fs.Inodes cannot be restored.
+		fs.SaveInodeMappings()
+
+		// Discard unsavable mappings, such as those for host file descriptors.
+		// This must be done after waiting for "asynchronous fs work", which
+		// includes async I/O that may touch application memory.
+		//
+		// TODO(gvisor.dev/issue/1624): This rationale is believed to be
+		// obsolete since AIO callbacks are now waited-for by Kernel.Pause(),
+		// but this order is conservatively retained for VFS1.
+		if err := k.invalidateUnsavableMappings(ctx); err != nil {
+			return fmt.Errorf("failed to invalidate unsavable mappings: %v", err)
+		}
 	}
 
 	// Save the CPUID FeatureSet before the rest of the kernel so we can
@@ -478,14 +502,14 @@ func (k *Kernel) SaveTo(w wire.Writer) error {
 	//
 	// N.B. This will also be saved along with the full kernel save below.
 	cpuidStart := time.Now()
-	if _, err := state.Save(k.SupervisorContext(), w, k.FeatureSet()); err != nil {
+	if _, err := state.Save(ctx, w, k.FeatureSet()); err != nil {
 		return err
 	}
 	log.Infof("CPUID save took [%s].", time.Since(cpuidStart))
 
 	// Save the kernel state.
 	kernelStart := time.Now()
-	stats, err := state.Save(k.SupervisorContext(), w, k)
+	stats, err := state.Save(ctx, w, k)
 	if err != nil {
 		return err
 	}
@@ -494,7 +518,7 @@ func (k *Kernel) SaveTo(w wire.Writer) error {
 
 	// Save the memory file's state.
 	memoryStart := time.Now()
-	if err := k.mf.SaveTo(k.SupervisorContext(), w); err != nil {
+	if err := k.mf.SaveTo(ctx, w); err != nil {
 		return err
 	}
 	log.Infof("Memory save took [%s].", time.Since(memoryStart))
@@ -506,6 +530,8 @@ func (k *Kernel) SaveTo(w wire.Writer) error {
 
 // flushMountSourceRefs flushes the MountSources for all mounted filesystems
 // and open FDs.
+//
+// Preconditions: !VFS2Enabled.
 func (k *Kernel) flushMountSourceRefs(ctx context.Context) error {
 	// Flush all mount sources for currently mounted filesystems in each task.
 	flushed := make(map[*fs.MountNamespace]struct{})
@@ -533,11 +559,6 @@ func (k *Kernel) flushMountSourceRefs(ctx context.Context) error {
 //
 // Precondition: Must be called with the kernel paused.
 func (ts *TaskSet) forEachFDPaused(ctx context.Context, f func(*fs.File, *vfs.FileDescription) error) (err error) {
-	// TODO(gvisor.dev/issue/1663): Add save support for VFS2.
-	if VFS2Enabled {
-		return nil
-	}
-
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
 	for t := range ts.Root.tids {
@@ -554,9 +575,9 @@ func (ts *TaskSet) forEachFDPaused(ctx context.Context, f func(*fs.File, *vfs.Fi
 	return err
 }
 
-func (ts *TaskSet) flushWritesToFiles(ctx context.Context) error {
-	// TODO(gvisor.dev/issue/1663): Add save support for VFS2.
-	return ts.forEachFDPaused(ctx, func(file *fs.File, _ *vfs.FileDescription) error {
+// Preconditions: !VFS2Enabled.
+func (k *Kernel) flushWritesToFiles(ctx context.Context) error {
+	return k.tasks.forEachFDPaused(ctx, func(file *fs.File, _ *vfs.FileDescription) error {
 		if flags := file.Flags(); !flags.Write {
 			return nil
 		}
@@ -576,6 +597,32 @@ func (ts *TaskSet) flushWritesToFiles(ctx context.Context) error {
 		}
 		return nil
 	})
+}
+
+// Preconditions: !VFS2Enabled.
+func (ts *TaskSet) unregisterEpollWaiters(ctx context.Context) {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+
+	// Tasks that belong to the same process could potentially point to the
+	// same FDTable. So we retain a map of processed ones to avoid
+	// processing the same FDTable multiple times.
+	processed := make(map[*FDTable]struct{})
+	for t := range ts.Root.tids {
+		// We can skip locking Task.mu here since the kernel is paused.
+		if t.fdTable == nil {
+			continue
+		}
+		if _, ok := processed[t.fdTable]; ok {
+			continue
+		}
+		t.fdTable.forEach(ctx, func(_ int32, file *fs.File, _ *vfs.FileDescription, _ FDFlags) {
+			if e, ok := file.FileOperations.(*epoll.EventPoll); ok {
+				e.UnregisterEpollWaiters()
+			}
+		})
+		processed[t.fdTable] = struct{}{}
+	}
 }
 
 // Preconditions: The kernel must be paused.
@@ -603,38 +650,8 @@ func (k *Kernel) invalidateUnsavableMappings(ctx context.Context) error {
 	return nil
 }
 
-func (ts *TaskSet) unregisterEpollWaiters(ctx context.Context) {
-	// TODO(gvisor.dev/issue/1663): Add save support for VFS2.
-	if VFS2Enabled {
-		return
-	}
-
-	ts.mu.RLock()
-	defer ts.mu.RUnlock()
-
-	// Tasks that belong to the same process could potentially point to the
-	// same FDTable. So we retain a map of processed ones to avoid
-	// processing the same FDTable multiple times.
-	processed := make(map[*FDTable]struct{})
-	for t := range ts.Root.tids {
-		// We can skip locking Task.mu here since the kernel is paused.
-		if t.fdTable == nil {
-			continue
-		}
-		if _, ok := processed[t.fdTable]; ok {
-			continue
-		}
-		t.fdTable.forEach(ctx, func(_ int32, file *fs.File, _ *vfs.FileDescription, _ FDFlags) {
-			if e, ok := file.FileOperations.(*epoll.EventPoll); ok {
-				e.UnregisterEpollWaiters()
-			}
-		})
-		processed[t.fdTable] = struct{}{}
-	}
-}
-
 // LoadFrom returns a new Kernel loaded from args.
-func (k *Kernel) LoadFrom(r wire.Reader, net inet.Stack, clocks sentrytime.Clocks) error {
+func (k *Kernel) LoadFrom(ctx context.Context, r wire.Reader, net inet.Stack, clocks sentrytime.Clocks, vfsOpts *vfs.CompleteRestoreOptions) error {
 	loadStart := time.Now()
 
 	initAppCores := k.applicationCores
@@ -645,7 +662,7 @@ func (k *Kernel) LoadFrom(r wire.Reader, net inet.Stack, clocks sentrytime.Clock
 	// don't need to explicitly install it in the Kernel.
 	cpuidStart := time.Now()
 	var features cpuid.FeatureSet
-	if _, err := state.Load(k.SupervisorContext(), r, &features); err != nil {
+	if _, err := state.Load(ctx, r, &features); err != nil {
 		return err
 	}
 	log.Infof("CPUID load took [%s].", time.Since(cpuidStart))
@@ -660,7 +677,7 @@ func (k *Kernel) LoadFrom(r wire.Reader, net inet.Stack, clocks sentrytime.Clock
 
 	// Load the kernel state.
 	kernelStart := time.Now()
-	stats, err := state.Load(k.SupervisorContext(), r, k)
+	stats, err := state.Load(ctx, r, k)
 	if err != nil {
 		return err
 	}
@@ -673,7 +690,7 @@ func (k *Kernel) LoadFrom(r wire.Reader, net inet.Stack, clocks sentrytime.Clock
 
 	// Load the memory file's state.
 	memoryStart := time.Now()
-	if err := k.mf.LoadFrom(k.SupervisorContext(), r); err != nil {
+	if err := k.mf.LoadFrom(ctx, r); err != nil {
 		return err
 	}
 	log.Infof("Memory load took [%s].", time.Since(memoryStart))
@@ -685,11 +702,17 @@ func (k *Kernel) LoadFrom(r wire.Reader, net inet.Stack, clocks sentrytime.Clock
 		net.Resume()
 	}
 
-	// Ensure that all pending asynchronous work is complete:
-	//   - namedpipe opening
-	//   - inode file opening
-	if err := fs.AsyncErrorBarrier(); err != nil {
-		return err
+	if VFS2Enabled {
+		if err := k.vfs.CompleteRestore(ctx, vfsOpts); err != nil {
+			return err
+		}
+	} else {
+		// Ensure that all pending asynchronous work is complete:
+		//   - namedpipe opening
+		//   - inode file opening
+		if err := fs.AsyncErrorBarrier(); err != nil {
+			return err
+		}
 	}
 
 	tcpip.AsyncLoading.Wait()
@@ -818,7 +841,9 @@ func (ctx *createProcessContext) Value(key interface{}) interface{} {
 	case CtxUTSNamespace:
 		return ctx.args.UTSNamespace
 	case CtxIPCNamespace:
-		return ctx.args.IPCNamespace
+		ipcns := ctx.args.IPCNamespace
+		ipcns.IncRef()
+		return ipcns
 	case auth.CtxCredentials:
 		return ctx.args.Credentials
 	case fs.CtxRoot:
@@ -831,14 +856,16 @@ func (ctx *createProcessContext) Value(key interface{}) interface{} {
 		if ctx.args.MountNamespaceVFS2 == nil {
 			return nil
 		}
-		// MountNamespaceVFS2.Root() takes a reference on the root dirent for us.
-		return ctx.args.MountNamespaceVFS2.Root()
+		root := ctx.args.MountNamespaceVFS2.Root()
+		root.IncRef()
+		return root
 	case vfs.CtxMountNamespace:
 		if ctx.k.globalInit == nil {
 			return nil
 		}
-		// MountNamespaceVFS2 takes a reference for us.
-		return ctx.k.GlobalInit().Leader().MountNamespaceVFS2()
+		mntns := ctx.k.GlobalInit().Leader().MountNamespaceVFS2()
+		mntns.IncRef()
+		return mntns
 	case fs.CtxDirentCacheLimiter:
 		return ctx.k.DirentCacheLimiter
 	case inet.CtxStack:
@@ -888,19 +915,19 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		opener    fsbridge.Lookup
 		fsContext *FSContext
 		mntns     *fs.MountNamespace
+		mntnsVFS2 *vfs.MountNamespace
 	)
 
 	if VFS2Enabled {
-		mntnsVFS2 := args.MountNamespaceVFS2
+		mntnsVFS2 = args.MountNamespaceVFS2
 		if mntnsVFS2 == nil {
-			// MountNamespaceVFS2 adds a reference to the namespace, which is
-			// transferred to the new process.
+			// Add a reference to the namespace, which is transferred to the new process.
 			mntnsVFS2 = k.globalInit.Leader().MountNamespaceVFS2()
+			mntnsVFS2.IncRef()
 		}
 		// Get the root directory from the MountNamespace.
-		root := args.MountNamespaceVFS2.Root()
-		// The call to newFSContext below will take a reference on root, so we
-		// don't need to hold this one.
+		root := mntnsVFS2.Root()
+		root.IncRef()
 		defer root.DecRef(ctx)
 
 		// Grab the working directory.
@@ -952,6 +979,10 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 	}
 
 	tg := k.NewThreadGroup(mntns, args.PIDNamespace, NewSignalHandlers(), linux.SIGCHLD, args.Limits)
+	cu := cleanup.Make(func() {
+		tg.Release(ctx)
+	})
+	defer cu.Clean()
 
 	// Check which file to start from.
 	switch {
@@ -1008,16 +1039,17 @@ func (k *Kernel) CreateProcess(args CreateProcessArgs) (*ThreadGroup, ThreadID, 
 		UTSNamespace:            args.UTSNamespace,
 		IPCNamespace:            args.IPCNamespace,
 		AbstractSocketNamespace: args.AbstractSocketNamespace,
-		MountNamespaceVFS2:      args.MountNamespaceVFS2,
+		MountNamespaceVFS2:      mntnsVFS2,
 		ContainerID:             args.ContainerID,
 	}
-	t, err := k.tasks.NewTask(config)
+	t, err := k.tasks.NewTask(ctx, config)
 	if err != nil {
 		return nil, 0, err
 	}
 	t.traceExecEvent(tc) // Simulate exec for tracing.
 
 	// Success.
+	cu.Release()
 	tgid := k.tasks.Root.IDOfThreadGroup(tg)
 	if k.globalInit == nil {
 		k.globalInit = tg
@@ -1362,8 +1394,9 @@ func (k *Kernel) RootUTSNamespace() *UTSNamespace {
 	return k.rootUTSNamespace
 }
 
-// RootIPCNamespace returns the root IPCNamespace.
+// RootIPCNamespace takes a reference and returns the root IPCNamespace.
 func (k *Kernel) RootIPCNamespace() *IPCNamespace {
+	k.rootIPCNamespace.IncRef()
 	return k.rootIPCNamespace
 }
 
@@ -1508,20 +1541,27 @@ func (k *Kernel) SupervisorContext() context.Context {
 	}
 }
 
-// SocketEntry represents a socket recorded in Kernel.sockets. It implements
+// SocketRecord represents a socket recorded in Kernel.socketsVFS2.
+//
+// +stateify savable
+type SocketRecord struct {
+	k        *Kernel
+	Sock     *refs.WeakRef        // TODO(gvisor.dev/issue/1624): Only used by VFS1.
+	SockVFS2 *vfs.FileDescription // Only used by VFS2.
+	ID       uint64               // Socket table entry number.
+}
+
+// SocketRecordVFS1 represents a socket recorded in Kernel.sockets. It implements
 // refs.WeakRefUser for sockets stored in the socket table.
 //
 // +stateify savable
-type SocketEntry struct {
+type SocketRecordVFS1 struct {
 	socketEntry
-	k        *Kernel
-	Sock     *refs.WeakRef
-	SockVFS2 *vfs.FileDescription
-	ID       uint64 // Socket table entry number.
+	SocketRecord
 }
 
 // WeakRefGone implements refs.WeakRefUser.WeakRefGone.
-func (s *SocketEntry) WeakRefGone(context.Context) {
+func (s *SocketRecordVFS1) WeakRefGone(context.Context) {
 	s.k.extMu.Lock()
 	s.k.sockets.Remove(s)
 	s.k.extMu.Unlock()
@@ -1532,9 +1572,14 @@ func (s *SocketEntry) WeakRefGone(context.Context) {
 // Precondition: Caller must hold a reference to sock.
 func (k *Kernel) RecordSocket(sock *fs.File) {
 	k.extMu.Lock()
-	id := k.nextSocketEntry
-	k.nextSocketEntry++
-	s := &SocketEntry{k: k, ID: id}
+	id := k.nextSocketRecord
+	k.nextSocketRecord++
+	s := &SocketRecordVFS1{
+		SocketRecord: SocketRecord{
+			k:  k,
+			ID: id,
+		},
+	}
 	s.Sock = refs.NewWeakRef(sock, s)
 	k.sockets.PushBack(s)
 	k.extMu.Unlock()
@@ -1546,29 +1591,45 @@ func (k *Kernel) RecordSocket(sock *fs.File) {
 // Precondition: Caller must hold a reference to sock.
 //
 // Note that the socket table will not hold a reference on the
-// vfs.FileDescription, because we do not support weak refs on VFS2 files.
+// vfs.FileDescription.
 func (k *Kernel) RecordSocketVFS2(sock *vfs.FileDescription) {
 	k.extMu.Lock()
-	id := k.nextSocketEntry
-	k.nextSocketEntry++
-	s := &SocketEntry{
+	if _, ok := k.socketsVFS2[sock]; ok {
+		panic(fmt.Sprintf("Socket %p added twice", sock))
+	}
+	id := k.nextSocketRecord
+	k.nextSocketRecord++
+	s := &SocketRecord{
 		k:        k,
 		ID:       id,
 		SockVFS2: sock,
 	}
-	k.sockets.PushBack(s)
+	k.socketsVFS2[sock] = s
+	k.extMu.Unlock()
+}
+
+// DeleteSocketVFS2 removes a VFS2 socket from the system-wide socket table.
+func (k *Kernel) DeleteSocketVFS2(sock *vfs.FileDescription) {
+	k.extMu.Lock()
+	delete(k.socketsVFS2, sock)
 	k.extMu.Unlock()
 }
 
 // ListSockets returns a snapshot of all sockets.
 //
-// Callers of ListSockets() in VFS2 should use SocketEntry.SockVFS2.TryIncRef()
+// Callers of ListSockets() in VFS2 should use SocketRecord.SockVFS2.TryIncRef()
 // to get a reference on a socket in the table.
-func (k *Kernel) ListSockets() []*SocketEntry {
+func (k *Kernel) ListSockets() []*SocketRecord {
 	k.extMu.Lock()
-	var socks []*SocketEntry
-	for s := k.sockets.Front(); s != nil; s = s.Next() {
-		socks = append(socks, s)
+	var socks []*SocketRecord
+	if VFS2Enabled {
+		for _, s := range k.socketsVFS2 {
+			socks = append(socks, s)
+		}
+	} else {
+		for s := k.sockets.Front(); s != nil; s = s.Next() {
+			socks = append(socks, &s.SocketRecord)
+		}
 	}
 	k.extMu.Unlock()
 	return socks
@@ -1596,7 +1657,9 @@ func (ctx supervisorContext) Value(key interface{}) interface{} {
 	case CtxUTSNamespace:
 		return ctx.k.rootUTSNamespace
 	case CtxIPCNamespace:
-		return ctx.k.rootIPCNamespace
+		ipcns := ctx.k.rootIPCNamespace
+		ipcns.IncRef()
+		return ipcns
 	case auth.CtxCredentials:
 		// The supervisor context is global root.
 		return auth.NewRootCredentials(ctx.k.rootUserNamespace)
@@ -1609,16 +1672,16 @@ func (ctx supervisorContext) Value(key interface{}) interface{} {
 		if ctx.k.globalInit == nil {
 			return vfs.VirtualDentry{}
 		}
-		mntns := ctx.k.GlobalInit().Leader().MountNamespaceVFS2()
-		defer mntns.DecRef(ctx)
-		// Root() takes a reference on the root dirent for us.
-		return mntns.Root()
+		root := ctx.k.GlobalInit().Leader().MountNamespaceVFS2().Root()
+		root.IncRef()
+		return root
 	case vfs.CtxMountNamespace:
 		if ctx.k.globalInit == nil {
 			return nil
 		}
-		// MountNamespaceVFS2() takes a reference for us.
-		return ctx.k.GlobalInit().Leader().MountNamespaceVFS2()
+		mntns := ctx.k.GlobalInit().Leader().MountNamespaceVFS2()
+		mntns.IncRef()
+		return mntns
 	case fs.CtxDirentCacheLimiter:
 		return ctx.k.DirentCacheLimiter
 	case inet.CtxStack:
@@ -1698,4 +1761,21 @@ func (k *Kernel) ShmMount() *vfs.Mount {
 // SocketMount returns the sockfs mount.
 func (k *Kernel) SocketMount() *vfs.Mount {
 	return k.socketMount
+}
+
+// Release releases resources owned by k.
+//
+// Precondition: This should only be called after the kernel is fully
+// initialized, e.g. after k.Start() has been called.
+func (k *Kernel) Release() {
+	ctx := k.SupervisorContext()
+	if VFS2Enabled {
+		k.hostMount.DecRef(ctx)
+		k.pipeMount.DecRef(ctx)
+		k.shmMount.DecRef(ctx)
+		k.socketMount.DecRef(ctx)
+		k.vfs.Release(ctx)
+	}
+	k.timekeeper.Destroy()
+	k.vdso.Release(ctx)
 }

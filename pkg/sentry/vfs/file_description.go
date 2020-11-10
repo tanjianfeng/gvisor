@@ -37,13 +37,13 @@ import (
 // FileDescription methods require that a reference is held.
 //
 // FileDescription is analogous to Linux's struct file.
+//
+// +stateify savable
 type FileDescription struct {
-	// refs is the reference count. refs is accessed using atomic memory
-	// operations.
-	refs int64
+	FileDescriptionRefs
 
 	// flagsMu protects statusFlags and asyncHandler below.
-	flagsMu sync.Mutex
+	flagsMu sync.Mutex `state:"nosave"`
 
 	// statusFlags contains status flags, "initialized by open(2) and possibly
 	// modified by fcntl()" - fcntl(2). statusFlags can be read using atomic
@@ -58,7 +58,7 @@ type FileDescription struct {
 
 	// epolls is the set of epollInterests registered for this FileDescription.
 	// epolls is protected by epollMu.
-	epollMu sync.Mutex
+	epollMu sync.Mutex `state:"nosave"`
 	epolls  map[*epollInterest]struct{}
 
 	// vd is the filesystem location at which this FileDescription was opened.
@@ -90,6 +90,8 @@ type FileDescription struct {
 }
 
 // FileDescriptionOptions contains options to FileDescription.Init().
+//
+// +stateify savable
 type FileDescriptionOptions struct {
 	// If AllowDirectIO is true, allow O_DIRECT to be set on the file.
 	AllowDirectIO bool
@@ -103,7 +105,7 @@ type FileDescriptionOptions struct {
 
 	// If UseDentryMetadata is true, calls to FileDescription methods that
 	// interact with file and filesystem metadata (Stat, SetStat, StatFS,
-	// Listxattr, Getxattr, Setxattr, Removexattr) are implemented by calling
+	// ListXattr, GetXattr, SetXattr, RemoveXattr) are implemented by calling
 	// the corresponding FilesystemImpl methods instead of the corresponding
 	// FileDescriptionImpl methods.
 	//
@@ -131,7 +133,7 @@ func (fd *FileDescription) Init(impl FileDescriptionImpl, flags uint32, mnt *Mou
 		}
 	}
 
-	fd.refs = 1
+	fd.EnableLeakCheck()
 
 	// Remove "file creation flags" to mirror the behavior from file.f_flags in
 	// fs/open.c:do_dentry_open.
@@ -149,30 +151,9 @@ func (fd *FileDescription) Init(impl FileDescriptionImpl, flags uint32, mnt *Mou
 	return nil
 }
 
-// IncRef increments fd's reference count.
-func (fd *FileDescription) IncRef() {
-	atomic.AddInt64(&fd.refs, 1)
-}
-
-// TryIncRef increments fd's reference count and returns true. If fd's
-// reference count is already zero, TryIncRef does nothing and returns false.
-//
-// TryIncRef does not require that a reference is held on fd.
-func (fd *FileDescription) TryIncRef() bool {
-	for {
-		refs := atomic.LoadInt64(&fd.refs)
-		if refs <= 0 {
-			return false
-		}
-		if atomic.CompareAndSwapInt64(&fd.refs, refs, refs+1) {
-			return true
-		}
-	}
-}
-
 // DecRef decrements fd's reference count.
 func (fd *FileDescription) DecRef(ctx context.Context) {
-	if refs := atomic.AddInt64(&fd.refs, -1); refs == 0 {
+	fd.FileDescriptionRefs.DecRef(func() {
 		// Unregister fd from all epoll instances.
 		fd.epollMu.Lock()
 		epolls := fd.epolls
@@ -202,21 +183,12 @@ func (fd *FileDescription) DecRef(ctx context.Context) {
 		}
 		fd.vd.DecRef(ctx)
 		fd.flagsMu.Lock()
-		// TODO(gvisor.dev/issue/1663): We may need to unregister during save, as we do in VFS1.
 		if fd.statusFlags&linux.O_ASYNC != 0 && fd.asyncHandler != nil {
 			fd.asyncHandler.Unregister(fd)
 		}
 		fd.asyncHandler = nil
 		fd.flagsMu.Unlock()
-	} else if refs < 0 {
-		panic("FileDescription.DecRef() called without holding a reference")
-	}
-}
-
-// Refs returns the current number of references. The returned count
-// is inherently racy and is unsafe to use without external synchronization.
-func (fd *FileDescription) Refs() int64 {
-	return atomic.LoadInt64(&fd.refs)
+	})
 }
 
 // Mount returns the mount on which fd was opened. It does not take a reference
@@ -357,6 +329,9 @@ type FileDescriptionImpl interface {
 	// Allocate grows the file to offset + length bytes.
 	// Only mode == 0 is supported currently.
 	//
+	// Allocate should return EISDIR on directories, ESPIPE on pipes, and ENODEV on
+	// other files where it is not supported.
+	//
 	// Preconditions: The FileDescription was opened for writing.
 	Allocate(ctx context.Context, mode, offset, length uint64) error
 
@@ -451,19 +426,19 @@ type FileDescriptionImpl interface {
 	// Ioctl implements the ioctl(2) syscall.
 	Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArguments) (uintptr, error)
 
-	// Listxattr returns all extended attribute names for the file.
-	Listxattr(ctx context.Context, size uint64) ([]string, error)
+	// ListXattr returns all extended attribute names for the file.
+	ListXattr(ctx context.Context, size uint64) ([]string, error)
 
-	// Getxattr returns the value associated with the given extended attribute
+	// GetXattr returns the value associated with the given extended attribute
 	// for the file.
-	Getxattr(ctx context.Context, opts GetxattrOptions) (string, error)
+	GetXattr(ctx context.Context, opts GetXattrOptions) (string, error)
 
-	// Setxattr changes the value associated with the given extended attribute
+	// SetXattr changes the value associated with the given extended attribute
 	// for the file.
-	Setxattr(ctx context.Context, opts SetxattrOptions) error
+	SetXattr(ctx context.Context, opts SetXattrOptions) error
 
-	// Removexattr removes the given extended attribute from the file.
-	Removexattr(ctx context.Context, name string) error
+	// RemoveXattr removes the given extended attribute from the file.
+	RemoveXattr(ctx context.Context, name string) error
 
 	// LockBSD tries to acquire a BSD-style advisory file lock.
 	LockBSD(ctx context.Context, uid lock.UniqueID, t lock.LockType, block lock.Blocker) error
@@ -479,6 +454,8 @@ type FileDescriptionImpl interface {
 }
 
 // Dirent holds the information contained in struct linux_dirent64.
+//
+// +stateify savable
 type Dirent struct {
 	// Name is the filename.
 	Name string
@@ -666,25 +643,25 @@ func (fd *FileDescription) Ioctl(ctx context.Context, uio usermem.IO, args arch.
 	return fd.impl.Ioctl(ctx, uio, args)
 }
 
-// Listxattr returns all extended attribute names for the file represented by
+// ListXattr returns all extended attribute names for the file represented by
 // fd.
 //
 // If the size of the list (including a NUL terminating byte after every entry)
 // would exceed size, ERANGE may be returned. Note that implementations
 // are free to ignore size entirely and return without error). In all cases,
 // if size is 0, the list should be returned without error, regardless of size.
-func (fd *FileDescription) Listxattr(ctx context.Context, size uint64) ([]string, error) {
+func (fd *FileDescription) ListXattr(ctx context.Context, size uint64) ([]string, error) {
 	if fd.opts.UseDentryMetadata {
 		vfsObj := fd.vd.mount.vfs
 		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
 			Root:  fd.vd,
 			Start: fd.vd,
 		})
-		names, err := fd.vd.mount.fs.impl.ListxattrAt(ctx, rp, size)
+		names, err := fd.vd.mount.fs.impl.ListXattrAt(ctx, rp, size)
 		vfsObj.putResolvingPath(ctx, rp)
 		return names, err
 	}
-	names, err := fd.impl.Listxattr(ctx, size)
+	names, err := fd.impl.ListXattr(ctx, size)
 	if err == syserror.ENOTSUP {
 		// Linux doesn't actually return ENOTSUP in this case; instead,
 		// fs/xattr.c:vfs_listxattr() falls back to allowing the security
@@ -695,57 +672,57 @@ func (fd *FileDescription) Listxattr(ctx context.Context, size uint64) ([]string
 	return names, err
 }
 
-// Getxattr returns the value associated with the given extended attribute for
+// GetXattr returns the value associated with the given extended attribute for
 // the file represented by fd.
 //
 // If the size of the return value exceeds opts.Size, ERANGE may be returned
 // (note that implementations are free to ignore opts.Size entirely and return
 // without error). In all cases, if opts.Size is 0, the value should be
 // returned without error, regardless of size.
-func (fd *FileDescription) Getxattr(ctx context.Context, opts *GetxattrOptions) (string, error) {
+func (fd *FileDescription) GetXattr(ctx context.Context, opts *GetXattrOptions) (string, error) {
 	if fd.opts.UseDentryMetadata {
 		vfsObj := fd.vd.mount.vfs
 		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
 			Root:  fd.vd,
 			Start: fd.vd,
 		})
-		val, err := fd.vd.mount.fs.impl.GetxattrAt(ctx, rp, *opts)
+		val, err := fd.vd.mount.fs.impl.GetXattrAt(ctx, rp, *opts)
 		vfsObj.putResolvingPath(ctx, rp)
 		return val, err
 	}
-	return fd.impl.Getxattr(ctx, *opts)
+	return fd.impl.GetXattr(ctx, *opts)
 }
 
-// Setxattr changes the value associated with the given extended attribute for
+// SetXattr changes the value associated with the given extended attribute for
 // the file represented by fd.
-func (fd *FileDescription) Setxattr(ctx context.Context, opts *SetxattrOptions) error {
+func (fd *FileDescription) SetXattr(ctx context.Context, opts *SetXattrOptions) error {
 	if fd.opts.UseDentryMetadata {
 		vfsObj := fd.vd.mount.vfs
 		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
 			Root:  fd.vd,
 			Start: fd.vd,
 		})
-		err := fd.vd.mount.fs.impl.SetxattrAt(ctx, rp, *opts)
+		err := fd.vd.mount.fs.impl.SetXattrAt(ctx, rp, *opts)
 		vfsObj.putResolvingPath(ctx, rp)
 		return err
 	}
-	return fd.impl.Setxattr(ctx, *opts)
+	return fd.impl.SetXattr(ctx, *opts)
 }
 
-// Removexattr removes the given extended attribute from the file represented
+// RemoveXattr removes the given extended attribute from the file represented
 // by fd.
-func (fd *FileDescription) Removexattr(ctx context.Context, name string) error {
+func (fd *FileDescription) RemoveXattr(ctx context.Context, name string) error {
 	if fd.opts.UseDentryMetadata {
 		vfsObj := fd.vd.mount.vfs
 		rp := vfsObj.getResolvingPath(auth.CredentialsFromContext(ctx), &PathOperation{
 			Root:  fd.vd,
 			Start: fd.vd,
 		})
-		err := fd.vd.mount.fs.impl.RemovexattrAt(ctx, rp, name)
+		err := fd.vd.mount.fs.impl.RemoveXattrAt(ctx, rp, name)
 		vfsObj.putResolvingPath(ctx, rp)
 		return err
 	}
-	return fd.impl.Removexattr(ctx, name)
+	return fd.impl.RemoveXattr(ctx, name)
 }
 
 // SyncFS instructs the filesystem containing fd to execute the semantics of
@@ -849,29 +826,43 @@ func (fd *FileDescription) SetAsyncHandler(newHandler func() FileAsync) FileAsyn
 }
 
 // FileReadWriteSeeker is a helper struct to pass a FileDescription as
-// io.Reader/io.Writer/io.ReadSeeker/etc.
+// io.Reader/io.Writer/io.ReadSeeker/io.ReaderAt/io.WriterAt/etc.
 type FileReadWriteSeeker struct {
-	Fd    *FileDescription
+	FD    *FileDescription
 	Ctx   context.Context
 	ROpts ReadOptions
 	WOpts WriteOptions
 }
 
+// ReadAt implements io.ReaderAt.ReadAt.
+func (f *FileReadWriteSeeker) ReadAt(p []byte, off int64) (int, error) {
+	dst := usermem.BytesIOSequence(p)
+	n, err := f.FD.PRead(f.Ctx, dst, off, f.ROpts)
+	return int(n), err
+}
+
 // Read implements io.ReadWriteSeeker.Read.
 func (f *FileReadWriteSeeker) Read(p []byte) (int, error) {
 	dst := usermem.BytesIOSequence(p)
-	ret, err := f.Fd.Read(f.Ctx, dst, f.ROpts)
-	return int(ret), err
+	n, err := f.FD.Read(f.Ctx, dst, f.ROpts)
+	return int(n), err
 }
 
 // Seek implements io.ReadWriteSeeker.Seek.
 func (f *FileReadWriteSeeker) Seek(offset int64, whence int) (int64, error) {
-	return f.Fd.Seek(f.Ctx, offset, int32(whence))
+	return f.FD.Seek(f.Ctx, offset, int32(whence))
+}
+
+// WriteAt implements io.WriterAt.WriteAt.
+func (f *FileReadWriteSeeker) WriteAt(p []byte, off int64) (int, error) {
+	dst := usermem.BytesIOSequence(p)
+	n, err := f.FD.PWrite(f.Ctx, dst, off, f.WOpts)
+	return int(n), err
 }
 
 // Write implements io.ReadWriteSeeker.Write.
 func (f *FileReadWriteSeeker) Write(p []byte) (int, error) {
 	buf := usermem.BytesIOSequence(p)
-	ret, err := f.Fd.Write(f.Ctx, buf, f.WOpts)
-	return int(ret), err
+	n, err := f.FD.Write(f.Ctx, buf, f.WOpts)
+	return int(n), err
 }

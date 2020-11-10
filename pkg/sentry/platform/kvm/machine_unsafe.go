@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // +build go1.12
-// +build !go1.16
+// +build !go1.17
 
 // Check go:linkname function signatures when updating Go version.
 
@@ -142,4 +142,30 @@ func (c *vCPU) waitUntilNot(state uint32) {
 	if errno != 0 && errno != syscall.EINTR && errno != syscall.EAGAIN {
 		panic("futex wait error")
 	}
+}
+
+// setSignalMask sets the vCPU signal mask.
+//
+// This must be called prior to running the vCPU.
+func (c *vCPU) setSignalMask() error {
+	// The layout of this structure implies that it will not necessarily be
+	// the same layout chosen by the Go compiler. It gets fudged here.
+	var data struct {
+		length uint32
+		mask1  uint32
+		mask2  uint32
+		_      uint32
+	}
+	data.length = 8 // Fixed sigset size.
+	data.mask1 = ^uint32(bounceSignalMask & 0xffffffff)
+	data.mask2 = ^uint32(bounceSignalMask >> 32)
+	if _, _, errno := syscall.RawSyscall(
+		syscall.SYS_IOCTL,
+		uintptr(c.fd),
+		_KVM_SET_SIGNAL_MASK,
+		uintptr(unsafe.Pointer(&data))); errno != 0 {
+		return fmt.Errorf("error setting signal mask: %v", errno)
+	}
+
+	return nil
 }

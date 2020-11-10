@@ -17,6 +17,7 @@ package tcp
 import (
 	"fmt"
 	"math"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -154,7 +155,6 @@ type sender struct {
 	closed      bool
 	writeNext   *segment
 	writeList   segmentList
-	rcList      rackSegmentList
 	resendTimer timer       `state:"nosave"`
 	resendWaker sleep.Waker `state:"nosave"`
 
@@ -264,6 +264,9 @@ func newSender(ep *endpoint, iss, irs seqnum.Value, sndWnd seqnum.Size, mss uint
 			highRxt:   iss,
 			rescueRxt: iss,
 		},
+		rc: rackControl{
+			fack: iss,
+		},
 		gso: ep.gso != nil,
 	}
 
@@ -368,7 +371,7 @@ func (s *sender) updateMaxPayloadSize(mtu, count int) {
 
 	// Rewind writeNext to the first segment exceeding the MTU. Do nothing
 	// if it is already before such a packet.
-	for seg := s.writeList.Front(); seg != nil; seg = seg.segEntry.Next() {
+	for seg := s.writeList.Front(); seg != nil; seg = seg.Next() {
 		if seg == s.writeNext {
 			// We got to writeNext before we could find a segment
 			// exceeding the MTU.
@@ -623,7 +626,6 @@ func (s *sender) splitSeg(seg *segment, size int) {
 	nSeg.data.TrimFront(size)
 	nSeg.sequenceNumber.UpdateForward(seqnum.Size(size))
 	s.writeList.InsertAfter(seg, nSeg)
-	s.rcList.InsertAfter(seg, nSeg)
 
 	// The segment being split does not carry PUSH flag because it is
 	// followed by the newly split segment.
@@ -655,7 +657,7 @@ func (s *sender) NextSeg(nextSegHint *segment) (nextSeg, hint *segment, rescueRt
 	var s3 *segment
 	var s4 *segment
 	// Step 1.
-	for seg := nextSegHint; seg != nil; seg = seg.segEntry.Next() {
+	for seg := nextSegHint; seg != nil; seg = seg.Next() {
 		// Stop iteration if we hit a segment that has never been
 		// transmitted (i.e. either it has no assigned sequence number
 		// or if it does have one, it's >= the next sequence number
@@ -685,7 +687,7 @@ func (s *sender) NextSeg(nextSegHint *segment) (nextSeg, hint *segment, rescueRt
 				// NextSeg():
 				//     (1.c) IsLost(S2) returns true.
 				if s.ep.scoreboard.IsLost(segSeq) {
-					return seg, seg.segEntry.Next(), false
+					return seg, seg.Next(), false
 				}
 
 				// NextSeg():
@@ -699,7 +701,7 @@ func (s *sender) NextSeg(nextSegHint *segment) (nextSeg, hint *segment, rescueRt
 				// SHOULD be returned.
 				if s3 == nil {
 					s3 = seg
-					hint = seg.segEntry.Next()
+					hint = seg.Next()
 				}
 			}
 			// NextSeg():
@@ -733,7 +735,7 @@ func (s *sender) NextSeg(nextSegHint *segment) (nextSeg, hint *segment, rescueRt
 	// range of one segment of up to SMSS octets of
 	// previously unsent data starting with sequence number
 	// HighData+1 MUST be returned."
-	for seg := s.writeNext; seg != nil; seg = seg.segEntry.Next() {
+	for seg := s.writeNext; seg != nil; seg = seg.Next() {
 		if s.isAssignedSequenceNumber(seg) && seg.sequenceNumber.LessThan(s.sndNxt) {
 			continue
 		}
@@ -775,16 +777,15 @@ func (s *sender) maybeSendSegment(seg *segment, limit int, end seqnum.Value) (se
 			// triggering bugs in poorly written DNS
 			// implementations.
 			var nextTooBig bool
-			for seg.segEntry.Next() != nil && seg.segEntry.Next().data.Size() != 0 {
-				if seg.data.Size()+seg.segEntry.Next().data.Size() > available {
+			for seg.Next() != nil && seg.Next().data.Size() != 0 {
+				if seg.data.Size()+seg.Next().data.Size() > available {
 					nextTooBig = true
 					break
 				}
-				seg.data.Append(seg.segEntry.Next().data)
+				seg.data.Append(seg.Next().data)
 
 				// Consume the segment that we just merged in.
-				s.writeList.Remove(seg.segEntry.Next())
-				s.rcList.Remove(seg.rackSegEntry.Next())
+				s.writeList.Remove(seg.Next())
 			}
 			if !nextTooBig && seg.data.Size() < available {
 				// Segment is not full.
@@ -951,7 +952,7 @@ func (s *sender) handleSACKRecovery(limit int, end seqnum.Value) (dataSent bool)
 			}
 			dataSent = true
 			s.outstanding++
-			s.writeNext = nextSeg.segEntry.Next()
+			s.writeNext = nextSeg.Next()
 			continue
 		}
 
@@ -964,7 +965,6 @@ func (s *sender) handleSACKRecovery(limit int, end seqnum.Value) (dataSent bool)
 		// transmitted in (C.1)."
 		s.outstanding++
 		dataSent = true
-
 		s.sendSegment(nextSeg)
 
 		segEnd := nextSeg.sequenceNumber.Add(nextSeg.logicalLen())
@@ -1039,7 +1039,7 @@ func (s *sender) sendData() {
 	if s.fr.active && s.ep.sackPermitted {
 		dataSent = s.handleSACKRecovery(s.maxPayloadSize, end)
 	} else {
-		for seg := s.writeNext; seg != nil && s.outstanding < s.sndCwnd; seg = seg.segEntry.Next() {
+		for seg := s.writeNext; seg != nil && s.outstanding < s.sndCwnd; seg = seg.Next() {
 			cwndLimit := (s.sndCwnd - s.outstanding) * s.maxPayloadSize
 			if cwndLimit < limit {
 				limit = cwndLimit
@@ -1047,7 +1047,7 @@ func (s *sender) sendData() {
 			if s.isAssignedSequenceNumber(seg) && s.ep.sackPermitted && s.ep.scoreboard.IsSACKED(seg.sackBlock()) {
 				// Move writeNext along so that we don't try and scan data that
 				// has already been SACKED.
-				s.writeNext = seg.segEntry.Next()
+				s.writeNext = seg.Next()
 				continue
 			}
 			if sent := s.maybeSendSegment(seg, limit, end); !sent {
@@ -1055,7 +1055,7 @@ func (s *sender) sendData() {
 			}
 			dataSent = true
 			s.outstanding += s.pCount(seg)
-			s.writeNext = seg.segEntry.Next()
+			s.writeNext = seg.Next()
 		}
 	}
 
@@ -1186,7 +1186,7 @@ func (s *sender) SetPipe() {
 	}
 	pipe := 0
 	smss := seqnum.Size(s.ep.scoreboard.SMSS())
-	for s1 := s.writeList.Front(); s1 != nil && s1.data.Size() != 0 && s.isAssignedSequenceNumber(s1); s1 = s1.segEntry.Next() {
+	for s1 := s.writeList.Front(); s1 != nil && s1.data.Size() != 0 && s.isAssignedSequenceNumber(s1); s1 = s1.Next() {
 		// With GSO each segment can be much larger than SMSS. So check the segment
 		// in SMSS sized ranges.
 		segEnd := s1.sequenceNumber.Add(seqnum.Size(s1.data.Size()))
@@ -1278,6 +1278,39 @@ func (s *sender) checkDuplicateAck(seg *segment) (rtx bool) {
 	return true
 }
 
+// Iterate the writeList and update RACK for each segment which is newly acked
+// either cumulatively or selectively. Loop through the segments which are
+// sacked, and update the RACK related variables and check for reordering.
+//
+// See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-08#section-7.2
+// steps 2 and 3.
+func (s *sender) walkSACK(rcvdSeg *segment) {
+	// Sort the SACK blocks. The first block is the most recent unacked
+	// block. The following blocks can be in arbitrary order.
+	sackBlocks := make([]header.SACKBlock, len(rcvdSeg.parsedOptions.SACKBlocks))
+	copy(sackBlocks, rcvdSeg.parsedOptions.SACKBlocks)
+	sort.Slice(sackBlocks, func(i, j int) bool {
+		return sackBlocks[j].Start.LessThan(sackBlocks[i].Start)
+	})
+
+	seg := s.writeList.Front()
+	for _, sb := range sackBlocks {
+		// This check excludes DSACK blocks.
+		if sb.Start.LessThanEq(rcvdSeg.ackNumber) || sb.Start.LessThanEq(s.sndUna) || s.sndNxt.LessThan(sb.End) {
+			continue
+		}
+
+		for seg != nil && seg.sequenceNumber.LessThan(sb.End) && seg.xmitCount != 0 {
+			if sb.Start.LessThanEq(seg.sequenceNumber) && !seg.acked {
+				s.rc.update(seg, rcvdSeg, s.ep.tsOffset)
+				s.rc.detectReorder(seg)
+				seg.acked = true
+			}
+			seg = seg.Next()
+		}
+	}
+}
+
 // handleRcvdSegment is called when a segment is received; it is responsible for
 // updating the send-related state.
 func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
@@ -1312,6 +1345,21 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 				rcvdSeg.hasNewSACKInfo = true
 			}
 		}
+
+		// See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-08
+		// section-7.2
+		// * Step 2: Update RACK stats.
+		//   If the ACK is not ignored as invalid, update the RACK.rtt
+		//   to be the RTT sample calculated using this ACK, and
+		//   continue.  If this ACK or SACK was for the most recently
+		//   sent packet, then record the RACK.xmit_ts timestamp and
+		//   RACK.end_seq sequence implied by this ACK.
+		// * Step 3: Detect packet reordering.
+		//   If the ACK selectively or cumulatively acknowledges an
+		//   unacknowledged and also never retransmitted sequence below
+		//   RACK.fack, then the corresponding packet has been
+		//   reordered and RACK.reord is set to TRUE.
+		s.walkSACK(rcvdSeg)
 		s.SetPipe()
 	}
 
@@ -1369,9 +1417,6 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 
 		ackLeft := acked
 		originalOutstanding := s.outstanding
-		s.rtt.Lock()
-		srtt := s.rtt.srtt
-		s.rtt.Unlock()
 		for ackLeft > 0 {
 			// We use logicalLen here because we can have FIN
 			// segments (which are always at the end of list) that
@@ -1388,18 +1433,18 @@ func (s *sender) handleRcvdSegment(rcvdSeg *segment) {
 			}
 
 			if s.writeNext == seg {
-				s.writeNext = seg.segEntry.Next()
+				s.writeNext = seg.Next()
 			}
 
 			// Update the RACK fields if SACK is enabled.
-			if s.ep.sackPermitted {
-				s.rc.Update(seg, rcvdSeg, srtt, s.ep.tsOffset)
+			if s.ep.sackPermitted && !seg.acked {
+				s.rc.update(seg, rcvdSeg, s.ep.tsOffset)
+				s.rc.detectReorder(seg)
 			}
 
 			s.writeList.Remove(seg)
-			s.rcList.Remove(seg)
 
-			// if SACK is enabled then Only reduce outstanding if
+			// If SACK is enabled then Only reduce outstanding if
 			// the segment was not previously SACKED as these have
 			// already been accounted for in SetPipe().
 			if !s.ep.sackPermitted || !s.ep.scoreboard.IsSACKED(seg.sackBlock()) {
@@ -1465,12 +1510,6 @@ func (s *sender) sendSegment(seg *segment) *tcpip.Error {
 		if s.sndCwnd < s.sndSsthresh {
 			s.ep.stack.Stats().TCP.SlowStartRetransmits.Increment()
 		}
-
-		// Move the segment which has to be retransmitted to the end of the list, as
-		// RACK requires the segments in the order of their transmission times.
-		// See: https://tools.ietf.org/html/draft-ietf-tcpm-rack-09#section-6.2
-		// Step 5
-		s.rcList.PushBack(seg)
 	}
 	seg.xmitTime = time.Now()
 	seg.xmitCount++

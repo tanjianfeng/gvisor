@@ -574,6 +574,11 @@ type Task struct {
 	//
 	// startTime is protected by mu.
 	startTime ktime.Time
+
+	// kcov is the kcov instance providing code coverage owned by this task.
+	//
+	// kcov is exclusive to the task goroutine.
+	kcov *Kcov
 }
 
 func (t *Task) savePtraceTracer() *Task {
@@ -651,7 +656,9 @@ func (t *Task) Value(key interface{}) interface{} {
 	case CtxUTSNamespace:
 		return t.utsns
 	case CtxIPCNamespace:
-		return t.ipcns
+		ipcns := t.IPCNamespace()
+		ipcns.IncRef()
+		return ipcns
 	case CtxTask:
 		return t
 	case auth.CtxCredentials:
@@ -730,7 +737,6 @@ func (t *Task) SyscallRestartBlock() SyscallRestartBlock {
 func (t *Task) IsChrooted() bool {
 	if VFS2Enabled {
 		realRoot := t.mountNamespaceVFS2.Root()
-		defer realRoot.DecRef(t)
 		root := t.fsContext.RootDirectoryVFS2()
 		defer root.DecRef(t)
 		return root != realRoot
@@ -863,7 +869,6 @@ func (t *Task) MountNamespace() *fs.MountNamespace {
 func (t *Task) MountNamespaceVFS2() *vfs.MountNamespace {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.mountNamespaceVFS2.IncRef()
 	return t.mountNamespaceVFS2
 }
 
@@ -902,4 +907,17 @@ func (t *Task) UID() uint32 {
 // TODO(gvisor.dev/issue/170): This method is not namespaced yet.
 func (t *Task) GID() uint32 {
 	return uint32(t.Credentials().EffectiveKGID)
+}
+
+// SetKcov sets the kcov instance associated with t.
+func (t *Task) SetKcov(k *Kcov) {
+	t.kcov = k
+}
+
+// ResetKcov clears the kcov instance associated with t.
+func (t *Task) ResetKcov() {
+	if t.kcov != nil {
+		t.kcov.OnTaskExit()
+		t.kcov = nil
+	}
 }

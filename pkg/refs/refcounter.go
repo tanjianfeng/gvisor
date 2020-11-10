@@ -234,6 +234,41 @@ const (
 	LeaksLogTraces
 )
 
+// Set implements flag.Value.
+func (l *LeakMode) Set(v string) error {
+	switch v {
+	case "disabled":
+		*l = NoLeakChecking
+	case "log-names":
+		*l = LeaksLogWarning
+	case "log-traces":
+		*l = LeaksLogTraces
+	default:
+		return fmt.Errorf("invalid ref leak mode %q", v)
+	}
+	return nil
+}
+
+// Get implements flag.Value.
+func (l *LeakMode) Get() interface{} {
+	return *l
+}
+
+// String implements flag.Value.
+func (l *LeakMode) String() string {
+	switch *l {
+	case UninitializedLeakChecking:
+		return "uninitialized"
+	case NoLeakChecking:
+		return "disabled"
+	case LeaksLogWarning:
+		return "log-names"
+	case LeaksLogTraces:
+		return "log-traces"
+	}
+	panic(fmt.Sprintf("invalid ref leak mode %d", *l))
+}
+
 // leakMode stores the current mode for the reference leak checker.
 //
 // Values must be one of the LeakMode values.
@@ -284,7 +319,8 @@ func makeStackKey(pcs []uintptr) stackKey {
 	return key
 }
 
-func recordStack() []uintptr {
+// RecordStack constructs and returns the PCs on the current stack.
+func RecordStack() []uintptr {
 	pcs := make([]uintptr, maxStackFrames)
 	n := runtime.Callers(1, pcs)
 	if n == 0 {
@@ -307,7 +343,8 @@ func recordStack() []uintptr {
 	return v
 }
 
-func formatStack(pcs []uintptr) string {
+// FormatStack converts the given stack into a readable format.
+func FormatStack(pcs []uintptr) string {
 	frames := runtime.CallersFrames(pcs)
 	var trace bytes.Buffer
 	for {
@@ -332,7 +369,7 @@ func (r *AtomicRefCount) finalize() {
 	if n := r.ReadRefs(); n != 0 {
 		msg := fmt.Sprintf("%sAtomicRefCount %p owned by %q garbage collected with ref count of %d (want 0)", note, r, r.name, n)
 		if len(r.stack) != 0 {
-			msg += ":\nCaller:\n" + formatStack(r.stack)
+			msg += ":\nCaller:\n" + FormatStack(r.stack)
 		} else {
 			msg += " (enable trace logging to debug)"
 		}
@@ -357,7 +394,7 @@ func (r *AtomicRefCount) EnableLeakCheck(name string) {
 	case NoLeakChecking:
 		return
 	case LeaksLogTraces:
-		r.stack = recordStack()
+		r.stack = RecordStack()
 	}
 	r.name = name
 	runtime.SetFinalizer(r, (*AtomicRefCount).finalize)

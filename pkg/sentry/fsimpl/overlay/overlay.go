@@ -18,10 +18,15 @@
 //
 // Lock order:
 //
-// directoryFD.mu / nonDirectoryFD.mu
+// directoryFD.mu / regularFileFD.mu
 //   filesystem.renameMu
 //     dentry.dirMu
 //       dentry.copyMu
+//         filesystem.devMu
+//         *** "memmap.Mappable locks" below this point
+//         dentry.mapsMu
+//           *** "memmap.Mappable locks taken by Translate" below this point
+//           dentry.dataMu
 //
 // Locking dentry.dirMu in multiple dentries requires that parent dentries are
 // locked before child dentries, and that filesystem.renameMu is locked to
@@ -29,14 +34,17 @@
 package overlay
 
 import (
+	"fmt"
 	"strings"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/refsvfs2"
 	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
@@ -46,6 +54,8 @@ import (
 const Name = "overlay"
 
 // FilesystemType implements vfs.FilesystemType.
+//
+// +stateify savable
 type FilesystemType struct{}
 
 // Name implements vfs.FilesystemType.Name.
@@ -53,8 +63,13 @@ func (FilesystemType) Name() string {
 	return Name
 }
 
+// Release implements FilesystemType.Release.
+func (FilesystemType) Release(ctx context.Context) {}
+
 // FilesystemOptions may be passed as vfs.GetFilesystemOptions.InternalData to
 // FilesystemType.GetFilesystem.
+//
+// +stateify savable
 type FilesystemOptions struct {
 	// Callers passing FilesystemOptions to
 	// overlay.FilesystemType.GetFilesystem() are responsible for ensuring that
@@ -71,6 +86,8 @@ type FilesystemOptions struct {
 }
 
 // filesystem implements vfs.FilesystemImpl.
+//
+// +stateify savable
 type filesystem struct {
 	vfsfs vfs.Filesystem
 
@@ -85,97 +102,93 @@ type filesystem struct {
 	// is immutable.
 	dirDevMinor uint32
 
-	// lowerDevMinors maps lower layer filesystems to device minor numbers
-	// assigned to non-directory files originating from that filesystem.
-	// lowerDevMinors is immutable.
-	lowerDevMinors map[*vfs.Filesystem]uint32
+	// lowerDevMinors maps device numbers from lower layer filesystems to
+	// device minor numbers assigned to non-directory files originating from
+	// that filesystem. (This remapping is necessary for lower layers because a
+	// file on a lower layer, and that same file on an overlay, are
+	// distinguishable because they will diverge after copy-up; this isn't true
+	// for non-directory files already on the upper layer.) lowerDevMinors is
+	// protected by devMu.
+	devMu          sync.Mutex `state:"nosave"`
+	lowerDevMinors map[layerDevNumber]uint32
 
 	// renameMu synchronizes renaming with non-renaming operations in order to
 	// ensure consistent lock ordering between dentry.dirMu in different
 	// dentries.
-	renameMu sync.RWMutex
+	renameMu sync.RWMutex `state:"nosave"`
 
 	// lastDirIno is the last inode number assigned to a directory. lastDirIno
 	// is accessed using atomic memory operations.
 	lastDirIno uint64
 }
 
+// +stateify savable
+type layerDevNumber struct {
+	major uint32
+	minor uint32
+}
+
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
 	mopts := vfs.GenericParseMountOptions(opts.Data)
 	fsoptsRaw := opts.InternalData
-	fsopts, haveFSOpts := fsoptsRaw.(FilesystemOptions)
-	if fsoptsRaw != nil && !haveFSOpts {
-		ctx.Warningf("overlay.FilesystemType.GetFilesystem: GetFilesystemOptions.InternalData has type %T, wanted overlay.FilesystemOptions or nil", fsoptsRaw)
+	fsopts, ok := fsoptsRaw.(FilesystemOptions)
+	if fsoptsRaw != nil && !ok {
+		ctx.Infof("overlay.FilesystemType.GetFilesystem: GetFilesystemOptions.InternalData has type %T, wanted overlay.FilesystemOptions or nil", fsoptsRaw)
 		return nil, nil, syserror.EINVAL
 	}
-	if haveFSOpts {
-		if len(fsopts.LowerRoots) == 0 {
-			ctx.Warningf("overlay.FilesystemType.GetFilesystem: LowerRoots must be non-empty")
-			return nil, nil, syserror.EINVAL
-		}
-		if len(fsopts.LowerRoots) < 2 && !fsopts.UpperRoot.Ok() {
-			ctx.Warningf("overlay.FilesystemType.GetFilesystem: at least two LowerRoots are required when UpperRoot is unspecified")
-			return nil, nil, syserror.EINVAL
-		}
-		// We don't enforce a maximum number of lower layers when not
-		// configured by applications; the sandbox owner can have an overlay
-		// filesystem with any number of lower layers.
-	} else {
-		vfsroot := vfs.RootFromContext(ctx)
+	vfsroot := vfs.RootFromContext(ctx)
+	if vfsroot.Ok() {
 		defer vfsroot.DecRef(ctx)
-		upperPathname, ok := mopts["upperdir"]
-		if ok {
-			delete(mopts, "upperdir")
-			// Linux overlayfs also requires a workdir when upperdir is
-			// specified; we don't, so silently ignore this option.
-			delete(mopts, "workdir")
-			upperPath := fspath.Parse(upperPathname)
-			if !upperPath.Absolute {
-				ctx.Warningf("overlay.FilesystemType.GetFilesystem: upperdir %q must be absolute", upperPathname)
-				return nil, nil, syserror.EINVAL
-			}
-			upperRoot, err := vfsObj.GetDentryAt(ctx, creds, &vfs.PathOperation{
-				Root:               vfsroot,
-				Start:              vfsroot,
-				Path:               upperPath,
-				FollowFinalSymlink: true,
-			}, &vfs.GetDentryOptions{
-				CheckSearchable: true,
-			})
-			if err != nil {
-				ctx.Warningf("overlay.FilesystemType.GetFilesystem: failed to resolve upperdir %q: %v", upperPathname, err)
-				return nil, nil, err
-			}
-			defer upperRoot.DecRef(ctx)
-			privateUpperRoot, err := clonePrivateMount(vfsObj, upperRoot, false /* forceReadOnly */)
-			if err != nil {
-				ctx.Warningf("overlay.FilesystemType.GetFilesystem: failed to make private bind mount of upperdir %q: %v", upperPathname, err)
-				return nil, nil, err
-			}
-			defer privateUpperRoot.DecRef(ctx)
-			fsopts.UpperRoot = privateUpperRoot
+	}
+
+	if upperPathname, ok := mopts["upperdir"]; ok {
+		if fsopts.UpperRoot.Ok() {
+			ctx.Infof("overlay.FilesystemType.GetFilesystem: both upperdir and FilesystemOptions.UpperRoot are specified")
+			return nil, nil, syserror.EINVAL
 		}
-		lowerPathnamesStr, ok := mopts["lowerdir"]
-		if !ok {
-			ctx.Warningf("overlay.FilesystemType.GetFilesystem: missing required option lowerdir")
+		delete(mopts, "upperdir")
+		// Linux overlayfs also requires a workdir when upperdir is
+		// specified; we don't, so silently ignore this option.
+		delete(mopts, "workdir")
+		upperPath := fspath.Parse(upperPathname)
+		if !upperPath.Absolute {
+			ctx.Infof("overlay.FilesystemType.GetFilesystem: upperdir %q must be absolute", upperPathname)
+			return nil, nil, syserror.EINVAL
+		}
+		upperRoot, err := vfsObj.GetDentryAt(ctx, creds, &vfs.PathOperation{
+			Root:               vfsroot,
+			Start:              vfsroot,
+			Path:               upperPath,
+			FollowFinalSymlink: true,
+		}, &vfs.GetDentryOptions{
+			CheckSearchable: true,
+		})
+		if err != nil {
+			ctx.Infof("overlay.FilesystemType.GetFilesystem: failed to resolve upperdir %q: %v", upperPathname, err)
+			return nil, nil, err
+		}
+		privateUpperRoot, err := clonePrivateMount(vfsObj, upperRoot, false /* forceReadOnly */)
+		upperRoot.DecRef(ctx)
+		if err != nil {
+			ctx.Infof("overlay.FilesystemType.GetFilesystem: failed to make private bind mount of upperdir %q: %v", upperPathname, err)
+			return nil, nil, err
+		}
+		defer privateUpperRoot.DecRef(ctx)
+		fsopts.UpperRoot = privateUpperRoot
+	}
+
+	if lowerPathnamesStr, ok := mopts["lowerdir"]; ok {
+		if len(fsopts.LowerRoots) != 0 {
+			ctx.Infof("overlay.FilesystemType.GetFilesystem: both lowerdir and FilesystemOptions.LowerRoots are specified")
 			return nil, nil, syserror.EINVAL
 		}
 		delete(mopts, "lowerdir")
 		lowerPathnames := strings.Split(lowerPathnamesStr, ":")
-		const maxLowerLayers = 500 // Linux: fs/overlay/super.c:OVL_MAX_STACK
-		if len(lowerPathnames) < 2 && !fsopts.UpperRoot.Ok() {
-			ctx.Warningf("overlay.FilesystemType.GetFilesystem: at least two lowerdirs are required when upperdir is unspecified")
-			return nil, nil, syserror.EINVAL
-		}
-		if len(lowerPathnames) > maxLowerLayers {
-			ctx.Warningf("overlay.FilesystemType.GetFilesystem: %d lowerdirs specified, maximum %d", len(lowerPathnames), maxLowerLayers)
-			return nil, nil, syserror.EINVAL
-		}
 		for _, lowerPathname := range lowerPathnames {
 			lowerPath := fspath.Parse(lowerPathname)
 			if !lowerPath.Absolute {
-				ctx.Warningf("overlay.FilesystemType.GetFilesystem: lowerdir %q must be absolute", lowerPathname)
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: lowerdir %q must be absolute", lowerPathname)
 				return nil, nil, syserror.EINVAL
 			}
 			lowerRoot, err := vfsObj.GetDentryAt(ctx, creds, &vfs.PathOperation{
@@ -187,43 +200,43 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 				CheckSearchable: true,
 			})
 			if err != nil {
-				ctx.Warningf("overlay.FilesystemType.GetFilesystem: failed to resolve lowerdir %q: %v", lowerPathname, err)
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: failed to resolve lowerdir %q: %v", lowerPathname, err)
 				return nil, nil, err
 			}
-			defer lowerRoot.DecRef(ctx)
 			privateLowerRoot, err := clonePrivateMount(vfsObj, lowerRoot, true /* forceReadOnly */)
+			lowerRoot.DecRef(ctx)
 			if err != nil {
-				ctx.Warningf("overlay.FilesystemType.GetFilesystem: failed to make private bind mount of lowerdir %q: %v", lowerPathname, err)
+				ctx.Infof("overlay.FilesystemType.GetFilesystem: failed to make private bind mount of lowerdir %q: %v", lowerPathname, err)
 				return nil, nil, err
 			}
 			defer privateLowerRoot.DecRef(ctx)
 			fsopts.LowerRoots = append(fsopts.LowerRoots, privateLowerRoot)
 		}
 	}
+
 	if len(mopts) != 0 {
-		ctx.Warningf("overlay.FilesystemType.GetFilesystem: unused options: %v", mopts)
+		ctx.Infof("overlay.FilesystemType.GetFilesystem: unused options: %v", mopts)
 		return nil, nil, syserror.EINVAL
 	}
 
-	// Allocate device numbers.
+	if len(fsopts.LowerRoots) == 0 {
+		ctx.Infof("overlay.FilesystemType.GetFilesystem: at least one lower layer is required")
+		return nil, nil, syserror.EINVAL
+	}
+	if len(fsopts.LowerRoots) < 2 && !fsopts.UpperRoot.Ok() {
+		ctx.Infof("overlay.FilesystemType.GetFilesystem: at least two lower layers are required when no upper layer is present")
+		return nil, nil, syserror.EINVAL
+	}
+	const maxLowerLayers = 500 // Linux: fs/overlay/super.c:OVL_MAX_STACK
+	if len(fsopts.LowerRoots) > maxLowerLayers {
+		ctx.Infof("overlay.FilesystemType.GetFilesystem: %d lower layers specified, maximum %d", len(fsopts.LowerRoots), maxLowerLayers)
+		return nil, nil, syserror.EINVAL
+	}
+
+	// Allocate dirDevMinor. lowerDevMinors are allocated dynamically.
 	dirDevMinor, err := vfsObj.GetAnonBlockDevMinor()
 	if err != nil {
 		return nil, nil, err
-	}
-	lowerDevMinors := make(map[*vfs.Filesystem]uint32)
-	for _, lowerRoot := range fsopts.LowerRoots {
-		lowerFS := lowerRoot.Mount().Filesystem()
-		if _, ok := lowerDevMinors[lowerFS]; !ok {
-			devMinor, err := vfsObj.GetAnonBlockDevMinor()
-			if err != nil {
-				vfsObj.PutAnonBlockDevMinor(dirDevMinor)
-				for _, lowerDevMinor := range lowerDevMinors {
-					vfsObj.PutAnonBlockDevMinor(lowerDevMinor)
-				}
-				return nil, nil, err
-			}
-			lowerDevMinors[lowerFS] = devMinor
-		}
 	}
 
 	// Take extra references held by the filesystem.
@@ -238,7 +251,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		opts:           fsopts,
 		creds:          creds.Fork(),
 		dirDevMinor:    dirDevMinor,
-		lowerDevMinors: lowerDevMinors,
+		lowerDevMinors: make(map[layerDevNumber]uint32),
 	}
 	fs.vfsfs.Init(vfsObj, &fstype, fs)
 
@@ -274,7 +287,7 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, syserror.EREMOTE
 	}
 	if isWhiteout(&rootStat) {
-		ctx.Warningf("overlay.FilesystemType.GetFilesystem: filesystem root is a whiteout")
+		ctx.Infof("overlay.FilesystemType.GetFilesystem: filesystem root is a whiteout")
 		root.destroyLocked(ctx)
 		fs.vfsfs.DecRef(ctx)
 		return nil, nil, syserror.EINVAL
@@ -288,7 +301,14 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		root.ino = fs.newDirIno()
 	} else if !root.upperVD.Ok() {
 		root.devMajor = linux.UNNAMED_MAJOR
-		root.devMinor = fs.lowerDevMinors[root.lowerVDs[0].Mount().Filesystem()]
+		rootDevMinor, err := fs.getLowerDevMinor(rootStat.DevMajor, rootStat.DevMinor)
+		if err != nil {
+			ctx.Infof("overlay.FilesystemType.GetFilesystem: failed to get device number for root: %v", err)
+			root.destroyLocked(ctx)
+			fs.vfsfs.DecRef(ctx)
+			return nil, nil, err
+		}
+		root.devMinor = rootDevMinor
 		root.ino = rootStat.Ino
 	} else {
 		root.devMajor = rootStat.DevMajor
@@ -315,7 +335,11 @@ func clonePrivateMount(vfsObj *vfs.VirtualFilesystem, vd vfs.VirtualDentry, forc
 	if err != nil {
 		return vfs.VirtualDentry{}, err
 	}
-	return vfs.MakeVirtualDentry(newmnt, vd.Dentry()), nil
+	// Take a reference on the dentry which will be owned by the returned
+	// VirtualDentry.
+	d := vd.Dentry()
+	d.IncRef()
+	return vfs.MakeVirtualDentry(newmnt, d), nil
 }
 
 // Release implements vfs.FilesystemImpl.Release.
@@ -357,7 +381,24 @@ func (fs *filesystem) newDirIno() uint64 {
 	return atomic.AddUint64(&fs.lastDirIno, 1)
 }
 
+func (fs *filesystem) getLowerDevMinor(layerMajor, layerMinor uint32) (uint32, error) {
+	fs.devMu.Lock()
+	defer fs.devMu.Unlock()
+	orig := layerDevNumber{layerMajor, layerMinor}
+	if minor, ok := fs.lowerDevMinors[orig]; ok {
+		return minor, nil
+	}
+	minor, err := fs.vfsfs.VirtualFilesystem().GetAnonBlockDevMinor()
+	if err != nil {
+		return 0, err
+	}
+	fs.lowerDevMinors[orig] = minor
+	return minor, nil
+}
+
 // dentry implements vfs.DentryImpl.
+//
+// +stateify savable
 type dentry struct {
 	vfsd vfs.Dentry
 
@@ -390,7 +431,7 @@ type dentry struct {
 	// and dirents (if not nil) is a cache of dirents as returned by
 	// directoryFDs representing this directory. children is protected by
 	// dirMu.
-	dirMu    sync.Mutex
+	dirMu    sync.Mutex `state:"nosave"`
 	children map[string]*dentry
 	dirents  []vfs.Dirent
 
@@ -400,7 +441,7 @@ type dentry struct {
 	// If !upperVD.Ok(), it can transition to a valid vfs.VirtualDentry (i.e.
 	// be copied up) with copyMu locked for writing; otherwise, it is
 	// immutable. lowerVDs is always immutable.
-	copyMu   sync.RWMutex
+	copyMu   sync.RWMutex `state:"nosave"`
 	upperVD  vfs.VirtualDentry
 	lowerVDs []vfs.VirtualDentry
 
@@ -415,7 +456,43 @@ type dentry struct {
 	devMinor uint32
 	ino      uint64
 
+	// If this dentry represents a regular file, then:
+	//
+	// - mapsMu is used to synchronize between copy-up and memmap.Mappable
+	// methods on dentry preceding mm.MemoryManager.activeMu in the lock order.
+	//
+	// - dataMu is used to synchronize between copy-up and
+	// dentry.(memmap.Mappable).Translate.
+	//
+	// - lowerMappings tracks memory mappings of the file. lowerMappings is
+	// used to invalidate mappings of the lower layer when the file is copied
+	// up to ensure that they remain coherent with subsequent writes to the
+	// file. (Note that, as of this writing, Linux overlayfs does not do this;
+	// this feature is a gVisor extension.) lowerMappings is protected by
+	// mapsMu.
+	//
+	// - If this dentry is copied-up, then wrappedMappable is the Mappable
+	// obtained from a call to the current top layer's
+	// FileDescription.ConfigureMMap(). Once wrappedMappable becomes non-nil
+	// (from a call to regularFileFD.ensureMappable()), it cannot become nil.
+	// wrappedMappable is protected by mapsMu and dataMu.
+	//
+	// - isMappable is non-zero iff wrappedMappable is non-nil. isMappable is
+	// accessed using atomic memory operations.
+	mapsMu          sync.Mutex `state:"nosave"`
+	lowerMappings   memmap.MappingSet
+	dataMu          sync.RWMutex `state:"nosave"`
+	wrappedMappable memmap.Mappable
+	isMappable      uint32
+
 	locks vfs.FileLocks
+
+	// watches is the set of inotify watches on the file repesented by this dentry.
+	//
+	// Note that hard links to the same file will not share the same set of
+	// watches, due to the fact that we do not have inode structures in this
+	// overlay implementation.
+	watches vfs.Watches
 }
 
 // newDentry creates a new dentry. The dentry initially has no references; it
@@ -428,6 +505,7 @@ func (fs *filesystem) newDentry() *dentry {
 	}
 	d.lowerVDs = d.inlineLowerVDs[:0]
 	d.vfsd.Init(d)
+	refsvfs2.Register(d)
 	return d
 }
 
@@ -435,17 +513,19 @@ func (fs *filesystem) newDentry() *dentry {
 func (d *dentry) IncRef() {
 	// d.refs may be 0 if d.fs.renameMu is locked, which serializes against
 	// d.checkDropLocked().
-	atomic.AddInt64(&d.refs, 1)
+	r := atomic.AddInt64(&d.refs, 1)
+	refsvfs2.LogIncRef(d, r)
 }
 
 // TryIncRef implements vfs.DentryImpl.TryIncRef.
 func (d *dentry) TryIncRef() bool {
 	for {
-		refs := atomic.LoadInt64(&d.refs)
-		if refs <= 0 {
+		r := atomic.LoadInt64(&d.refs)
+		if r <= 0 {
 			return false
 		}
-		if atomic.CompareAndSwapInt64(&d.refs, refs, refs+1) {
+		if atomic.CompareAndSwapInt64(&d.refs, r, r+1) {
+			refsvfs2.LogTryIncRef(d, r+1)
 			return true
 		}
 	}
@@ -453,12 +533,24 @@ func (d *dentry) TryIncRef() bool {
 
 // DecRef implements vfs.DentryImpl.DecRef.
 func (d *dentry) DecRef(ctx context.Context) {
-	if refs := atomic.AddInt64(&d.refs, -1); refs == 0 {
+	r := atomic.AddInt64(&d.refs, -1)
+	refsvfs2.LogDecRef(d, r)
+	if r == 0 {
 		d.fs.renameMu.Lock()
 		d.checkDropLocked(ctx)
 		d.fs.renameMu.Unlock()
-	} else if refs < 0 {
+	} else if r < 0 {
 		panic("overlay.dentry.DecRef() called without holding a reference")
+	}
+}
+
+func (d *dentry) decRefLocked(ctx context.Context) {
+	r := atomic.AddInt64(&d.refs, -1)
+	refsvfs2.LogDecRef(d, r)
+	if r == 0 {
+		d.checkDropLocked(ctx)
+	} else if r < 0 {
+		panic("overlay.dentry.decRefLocked() called without holding a reference")
 	}
 }
 
@@ -475,6 +567,14 @@ func (d *dentry) checkDropLocked(ctx context.Context) {
 	if atomic.LoadInt64(&d.refs) != 0 {
 		return
 	}
+
+	// Make sure that we do not lose watches on dentries that have not been
+	// deleted. Note that overlayfs never calls VFS.InvalidateDentry(), so
+	// d.vfsd.IsDead() indicates that d was deleted.
+	if !d.vfsd.IsDead() && d.watches.Size() > 0 {
+		return
+	}
+
 	// Refs is still zero; destroy it.
 	d.destroyLocked(ctx)
 	return
@@ -503,6 +603,8 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 		lowerVD.DecRef(ctx)
 	}
 
+	d.watches.HandleDeletion(ctx)
+
 	if d.parent != nil {
 		d.parent.dirMu.Lock()
 		if !d.vfsd.IsDead() {
@@ -511,29 +613,61 @@ func (d *dentry) destroyLocked(ctx context.Context) {
 		d.parent.dirMu.Unlock()
 		// Drop the reference held by d on its parent without recursively
 		// locking d.fs.renameMu.
-		if refs := atomic.AddInt64(&d.parent.refs, -1); refs == 0 {
-			d.parent.checkDropLocked(ctx)
-		} else if refs < 0 {
-			panic("overlay.dentry.DecRef() called without holding a reference")
-		}
+		d.parent.decRefLocked(ctx)
 	}
+	refsvfs2.Unregister(d)
+}
+
+// RefType implements refsvfs2.CheckedObject.Type.
+func (d *dentry) RefType() string {
+	return "overlay.dentry"
+}
+
+// LeakMessage implements refsvfs2.CheckedObject.LeakMessage.
+func (d *dentry) LeakMessage() string {
+	return fmt.Sprintf("[overlay.dentry %p] reference count of %d instead of -1", d, atomic.LoadInt64(&d.refs))
+}
+
+// LogRefs implements refsvfs2.CheckedObject.LogRefs.
+//
+// This should only be set to true for debugging purposes, as it can generate an
+// extremely large amount of output and drastically degrade performance.
+func (d *dentry) LogRefs() bool {
+	return false
 }
 
 // InotifyWithParent implements vfs.DentryImpl.InotifyWithParent.
 func (d *dentry) InotifyWithParent(ctx context.Context, events uint32, cookie uint32, et vfs.EventType) {
-	// TODO(gvisor.dev/issue/1479): Implement inotify.
+	if d.isDir() {
+		events |= linux.IN_ISDIR
+	}
+
+	// overlayfs never calls VFS.InvalidateDentry(), so d.vfsd.IsDead() indicates
+	// that d was deleted.
+	deleted := d.vfsd.IsDead()
+
+	d.fs.renameMu.RLock()
+	// The ordering below is important, Linux always notifies the parent first.
+	if d.parent != nil {
+		d.parent.watches.Notify(ctx, d.name, events, cookie, et, deleted)
+	}
+	d.watches.Notify(ctx, "", events, cookie, et, deleted)
+	d.fs.renameMu.RUnlock()
 }
 
 // Watches implements vfs.DentryImpl.Watches.
 func (d *dentry) Watches() *vfs.Watches {
-	// TODO(gvisor.dev/issue/1479): Implement inotify.
-	return nil
+	return &d.watches
 }
 
 // OnZeroWatches implements vfs.DentryImpl.OnZeroWatches.
-//
-// TODO(gvisor.dev/issue/1479): Implement inotify.
-func (d *dentry) OnZeroWatches(context.Context) {}
+func (d *dentry) OnZeroWatches(ctx context.Context) {
+	if atomic.LoadInt64(&d.refs) == 0 {
+		d.fs.renameMu.Lock()
+		d.checkDropLocked(ctx)
+		d.fs.renameMu.Unlock()
+	}
+}
 
 // iterLayers invokes yield on each layer comprising d, from top to bottom. If
 // any call to yield returns false, iterLayer stops iteration.
@@ -564,6 +698,16 @@ func (d *dentry) topLayer() vfs.VirtualDentry {
 
 func (d *dentry) checkPermissions(creds *auth.Credentials, ats vfs.AccessTypes) error {
 	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(atomic.LoadUint32(&d.mode)), auth.KUID(atomic.LoadUint32(&d.uid)), auth.KGID(atomic.LoadUint32(&d.gid)))
+}
+
+func (d *dentry) checkXattrPermissions(creds *auth.Credentials, name string, ats vfs.AccessTypes) error {
+	mode := linux.FileMode(atomic.LoadUint32(&d.mode))
+	kuid := auth.KUID(atomic.LoadUint32(&d.uid))
+	kgid := auth.KGID(atomic.LoadUint32(&d.gid))
+	if err := vfs.GenericCheckPermissions(creds, ats, mode, kuid, kgid); err != nil {
+		return err
+	}
+	return vfs.CheckXattrPermissions(creds, ats, mode, kuid, name)
 }
 
 // statInternalMask is the set of stat fields that is set by
@@ -604,6 +748,8 @@ func (d *dentry) updateAfterSetStatLocked(opts *vfs.SetStatOptions) {
 
 // fileDescription is embedded by overlay implementations of
 // vfs.FileDescriptionImpl.
+//
+// +stateify savable
 type fileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -616,6 +762,48 @@ func (fd *fileDescription) filesystem() *filesystem {
 
 func (fd *fileDescription) dentry() *dentry {
 	return fd.vfsfd.Dentry().Impl().(*dentry)
+}
+
+// ListXattr implements vfs.FileDescriptionImpl.ListXattr.
+func (fd *fileDescription) ListXattr(ctx context.Context, size uint64) ([]string, error) {
+	return fd.filesystem().listXattr(ctx, fd.dentry(), size)
+}
+
+// GetXattr implements vfs.FileDescriptionImpl.GetXattr.
+func (fd *fileDescription) GetXattr(ctx context.Context, opts vfs.GetXattrOptions) (string, error) {
+	return fd.filesystem().getXattr(ctx, fd.dentry(), auth.CredentialsFromContext(ctx), &opts)
+}
+
+// SetXattr implements vfs.FileDescriptionImpl.SetXattr.
+func (fd *fileDescription) SetXattr(ctx context.Context, opts vfs.SetXattrOptions) error {
+	fs := fd.filesystem()
+	d := fd.dentry()
+
+	fs.renameMu.RLock()
+	err := fs.setXattrLocked(ctx, d, fd.vfsfd.Mount(), auth.CredentialsFromContext(ctx), &opts)
+	fs.renameMu.RUnlock()
+	if err != nil {
+		return err
+	}
+
+	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
+	return nil
+}
+
+// RemoveXattr implements vfs.FileDescriptionImpl.RemoveXattr.
+func (fd *fileDescription) RemoveXattr(ctx context.Context, name string) error {
+	fs := fd.filesystem()
+	d := fd.dentry()
+
+	fs.renameMu.RLock()
+	err := fs.removeXattrLocked(ctx, d, fd.vfsfd.Mount(), auth.CredentialsFromContext(ctx), name)
+	fs.renameMu.RUnlock()
+	if err != nil {
+		return err
+	}
+
+	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
+	return nil
 }
 
 // LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.

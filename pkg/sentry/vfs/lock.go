@@ -12,11 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package lock provides POSIX and BSD style file locking for VFS2 file
-// implementations.
-//
-// The actual implementations can be found in the lock package under
-// sentry/fs/lock.
 package vfs
 
 import (
@@ -33,6 +28,8 @@ import (
 // Note that in Linux these two types of locks are _not_ cooperative, because
 // race and deadlock conditions make merging them prohibitive. We do the same
 // and keep them oblivious to each other.
+//
+// +stateify savable
 type FileLocks struct {
 	// bsd is a set of BSD-style advisory file wide locks, see flock(2).
 	bsd fslock.Locks

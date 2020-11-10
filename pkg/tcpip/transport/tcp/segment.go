@@ -15,6 +15,7 @@
 package tcp
 
 import (
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -24,19 +25,29 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
+// queueFlags are used to indicate which queue of an endpoint a particular segment
+// belongs to. This is used to track memory accounting correctly.
+type queueFlags uint8
+
+const (
+	recvQ queueFlags = 1 << iota
+	sendQ
+)
+
 // segment represents a TCP segment. It holds the payload and parsed TCP segment
 // information, and can be added to intrusive lists.
 // segment is mostly immutable, the only field allowed to change is viewToDeliver.
 //
 // +stateify savable
 type segment struct {
-	segEntry     segmentEntry
-	rackSegEntry rackSegmentEntry
-	refCnt       int32
-	id           stack.TransportEndpointID `state:"manual"`
-	route        stack.Route               `state:"manual"`
-	data         buffer.VectorisedView     `state:".(buffer.VectorisedView)"`
-	hdr          header.TCP
+	segmentEntry
+	refCnt int32
+	ep     *endpoint
+	qFlags queueFlags
+	id     stack.TransportEndpointID `state:"manual"`
+	route  stack.Route               `state:"manual"`
+	data   buffer.VectorisedView     `state:".(buffer.VectorisedView)"`
+	hdr    header.TCP
 	// views is used as buffer for data when its length is large
 	// enough to store a VectorisedView.
 	views [8]buffer.View `state:"nosave"`
@@ -60,17 +71,10 @@ type segment struct {
 	// xmitTime is the last transmit time of this segment.
 	xmitTime  time.Time `state:".(unixTime)"`
 	xmitCount uint32
+
+	// acked indicates if the segment has already been SACKed.
+	acked bool
 }
-
-// segmentMapper is the ElementMapper for the writeList.
-type segmentMapper struct{}
-
-func (segmentMapper) linkerFor(seg *segment) *segmentEntry { return &seg.segEntry }
-
-// rackSegmentMapper is the ElementMapper for the rcList.
-type rackSegmentMapper struct{}
-
-func (rackSegmentMapper) linkerFor(seg *segment) *rackSegmentEntry { return &seg.rackSegEntry }
 
 func newSegment(r *stack.Route, id stack.TransportEndpointID, pkt *stack.PacketBuffer) *segment {
 	s := &segment{
@@ -111,6 +115,8 @@ func (s *segment) clone() *segment {
 		rcvdTime:       s.rcvdTime,
 		xmitTime:       s.xmitTime,
 		xmitCount:      s.xmitCount,
+		ep:             s.ep,
+		qFlags:         s.qFlags,
 	}
 	t.data = s.data.Clone(t.views[:])
 	return t
@@ -126,8 +132,34 @@ func (s *segment) flagsAreSet(flags uint8) bool {
 	return s.flags&flags == flags
 }
 
+// setOwner sets the owning endpoint for this segment. Its required
+// to be called to ensure memory accounting for receive/send buffer
+// queues is done properly.
+func (s *segment) setOwner(ep *endpoint, qFlags queueFlags) {
+	switch qFlags {
+	case recvQ:
+		ep.updateReceiveMemUsed(s.segMemSize())
+	case sendQ:
+		// no memory account for sendQ yet.
+	default:
+		panic(fmt.Sprintf("unexpected queue flag %b", qFlags))
+	}
+	s.ep = ep
+	s.qFlags = qFlags
+}
+
 func (s *segment) decRef() {
 	if atomic.AddInt32(&s.refCnt, -1) == 0 {
+		if s.ep != nil {
+			switch s.qFlags {
+			case recvQ:
+				s.ep.updateReceiveMemUsed(-s.segMemSize())
+			case sendQ:
+				// no memory accounting for sendQ yet.
+			default:
+				panic(fmt.Sprintf("unexpected queue flag %b set for segment", s.qFlags))
+			}
+		}
 		s.route.Release()
 	}
 }
@@ -147,6 +179,11 @@ func (s *segment) logicalLen() seqnum.Size {
 		l++
 	}
 	return l
+}
+
+// payloadSize is the size of s.data.
+func (s *segment) payloadSize() int {
+	return s.data.Size()
 }
 
 // segMemSize is the amount of memory used to hold the segment data and

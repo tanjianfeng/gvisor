@@ -17,6 +17,7 @@ package mm
 import (
 	"fmt"
 	mrand "math/rand"
+	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
@@ -24,7 +25,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
-	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -93,18 +93,6 @@ func (mm *MemoryManager) MMap(ctx context.Context, opts memmap.MMapOpts) (userme
 		}
 	} else {
 		opts.Offset = 0
-		if !opts.Private {
-			if opts.MappingIdentity != nil {
-				return 0, syserror.EINVAL
-			}
-			m, err := NewSharedAnonMappable(opts.Length, pgalloc.MemoryFileProviderFromContext(ctx))
-			if err != nil {
-				return 0, err
-			}
-			defer m.DecRef(ctx)
-			opts.MappingIdentity = m
-			opts.Mappable = m
-		}
 	}
 
 	if opts.Addr.RoundDown() != opts.Addr {
@@ -1286,4 +1274,28 @@ func (mm *MemoryManager) VirtualDataSize() uint64 {
 	mm.mappingMu.RLock()
 	defer mm.mappingMu.RUnlock()
 	return mm.dataAS
+}
+
+// EnableMembarrierPrivate causes future calls to IsMembarrierPrivateEnabled to
+// return true.
+func (mm *MemoryManager) EnableMembarrierPrivate() {
+	atomic.StoreUint32(&mm.membarrierPrivateEnabled, 1)
+}
+
+// IsMembarrierPrivateEnabled returns true if mm.EnableMembarrierPrivate() has
+// previously been called.
+func (mm *MemoryManager) IsMembarrierPrivateEnabled() bool {
+	return atomic.LoadUint32(&mm.membarrierPrivateEnabled) != 0
+}
+
+// EnableMembarrierRSeq causes future calls to IsMembarrierRSeqEnabled to
+// return true.
+func (mm *MemoryManager) EnableMembarrierRSeq() {
+	atomic.StoreUint32(&mm.membarrierRSeqEnabled, 1)
+}
+
+// IsMembarrierRSeqEnabled returns true if mm.EnableMembarrierRSeq() has
+// previously been called.
+func (mm *MemoryManager) IsMembarrierRSeqEnabled() bool {
+	return atomic.LoadUint32(&mm.membarrierRSeqEnabled) != 0
 }

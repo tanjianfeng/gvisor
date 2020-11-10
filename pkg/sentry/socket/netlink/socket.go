@@ -16,11 +16,14 @@
 package netlink
 
 import (
+	"io"
 	"math"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/binary"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/marshal"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/device"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
@@ -38,8 +41,6 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
-	"gvisor.dev/gvisor/tools/go_marshal/marshal"
-	"gvisor.dev/gvisor/tools/go_marshal/primitive"
 )
 
 const sizeOfInt32 int = 4
@@ -748,6 +749,12 @@ func (s *socketOpsCommon) sendMsg(ctx context.Context, src usermem.IOSequence, t
 
 	buf := make([]byte, src.NumBytes())
 	n, err := src.CopyIn(ctx, buf)
+	// io.EOF can be only returned if src is a file, this means that
+	// sendMsg is called from splice and the error has to be ignored in
+	// this case.
+	if err == io.EOF {
+		err = nil
+	}
 	if err != nil {
 		// Don't partially consume messages.
 		return 0, syserr.FromError(err)

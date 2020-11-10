@@ -38,6 +38,8 @@ const (
 	_KVM_ARM64_REGS_SCTLR_EL1  = 0x603000000013c080
 	_KVM_ARM64_REGS_CPACR_EL1  = 0x603000000013c082
 	_KVM_ARM64_REGS_VBAR_EL1   = 0x603000000013c600
+	_KVM_ARM64_REGS_TIMER_CNT  = 0x603000000013df1a
+	_KVM_ARM64_REGS_CNTFRQ_EL0 = 0x603000000013df00
 )
 
 // Arm64: Architectural Feature Access Control Register EL1.
@@ -101,13 +103,20 @@ const (
 
 // Arm64: Memory Attribute Indirection Register EL1.
 const (
-	_MT_DEVICE_nGnRnE = 0
-	_MT_DEVICE_nGnRE  = 1
-	_MT_DEVICE_GRE    = 2
-	_MT_NORMAL_NC     = 3
-	_MT_NORMAL        = 4
-	_MT_NORMAL_WT     = 5
-	_MT_EL1_INIT      = (0 << _MT_DEVICE_nGnRnE) | (0x4 << _MT_DEVICE_nGnRE * 8) | (0xc << _MT_DEVICE_GRE * 8) | (0x44 << _MT_NORMAL_NC * 8) | (0xff << _MT_NORMAL * 8) | (0xbb << _MT_NORMAL_WT * 8)
+	_MT_DEVICE_nGnRnE      = 0
+	_MT_DEVICE_nGnRE       = 1
+	_MT_DEVICE_GRE         = 2
+	_MT_NORMAL_NC          = 3
+	_MT_NORMAL             = 4
+	_MT_NORMAL_WT          = 5
+	_MT_ATTR_DEVICE_nGnRnE = 0x00
+	_MT_ATTR_DEVICE_nGnRE  = 0x04
+	_MT_ATTR_DEVICE_GRE    = 0x0c
+	_MT_ATTR_NORMAL_NC     = 0x44
+	_MT_ATTR_NORMAL_WT     = 0xbb
+	_MT_ATTR_NORMAL        = 0xff
+	_MT_ATTR_MASK          = 0xff
+	_MT_EL1_INIT           = (_MT_ATTR_DEVICE_nGnRnE << (_MT_DEVICE_nGnRnE * 8)) | (_MT_ATTR_DEVICE_nGnRE << (_MT_DEVICE_nGnRE * 8)) | (_MT_ATTR_DEVICE_GRE << (_MT_DEVICE_GRE * 8)) | (_MT_ATTR_NORMAL_NC << (_MT_NORMAL_NC * 8)) | (_MT_ATTR_NORMAL << (_MT_NORMAL * 8)) | (_MT_ATTR_NORMAL_WT << (_MT_NORMAL_WT * 8))
 )
 
 const (

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // +build go1.12
-// +build !go1.16
+// +build !go1.17
 
 // Check go:linkname function signatures when updating Go version.
 
@@ -34,6 +34,8 @@ import (
 // structurally identical to VirtualDentry, but stores its fields as
 // unsafe.Pointer since mutators synchronize with VFS path traversal using
 // seqcounts.
+//
+// This is explicitly not savable.
 type mountKey struct {
 	parent unsafe.Pointer // *Mount
 	point  unsafe.Pointer // *Dentry
@@ -47,18 +49,22 @@ func (mnt *Mount) point() *Dentry {
 	return (*Dentry)(atomic.LoadPointer(&mnt.key.point))
 }
 
-func (mnt *Mount) loadKey() VirtualDentry {
+func (mnt *Mount) getKey() VirtualDentry {
 	return VirtualDentry{
 		mount:  mnt.parent(),
 		dentry: mnt.point(),
 	}
 }
 
+func (mnt *Mount) saveKey() VirtualDentry { return mnt.getKey() }
+
 // Invariant: mnt.key.parent == nil. vd.Ok().
-func (mnt *Mount) storeKey(vd VirtualDentry) {
+func (mnt *Mount) setKey(vd VirtualDentry) {
 	atomic.StorePointer(&mnt.key.parent, unsafe.Pointer(vd.mount))
 	atomic.StorePointer(&mnt.key.point, unsafe.Pointer(vd.dentry))
 }
+
+func (mnt *Mount) loadKey(vd VirtualDentry) { mnt.setKey(vd) }
 
 // mountTable maps (mount parent, mount point) pairs to mounts. It supports
 // efficient concurrent lookup, even in the presence of concurrent mutators
@@ -202,6 +208,26 @@ loop:
 			}
 			off = (off + mountSlotBytes) & offmask
 		}
+	}
+}
+
+// Range calls f on each Mount in mt. If f returns false, Range stops iteration
+// and returns immediately.
+func (mt *mountTable) Range(f func(*Mount) bool) {
+	tcap := uintptr(1) << (mt.size & mtSizeOrderMask)
+	slotPtr := mt.slots
+	last := unsafe.Pointer(uintptr(mt.slots) + ((tcap - 1) * mountSlotBytes))
+	for {
+		slot := (*mountSlot)(slotPtr)
+		if slot.value != nil {
+			if !f((*Mount)(slot.value)) {
+				return
+			}
+		}
+		if slotPtr == last {
+			return
+		}
+		slotPtr = unsafe.Pointer(uintptr(slotPtr) + mountSlotBytes)
 	}
 }
 

@@ -79,7 +79,7 @@ func (c *vCPU) initArchState() error {
 	}
 
 	// tcr_el1
-	data = _TCR_TXSZ_VA48 | _TCR_CACHE_FLAGS | _TCR_SHARED | _TCR_TG_FLAGS | _TCR_ASID16 | _TCR_IPS_40BITS
+	data = _TCR_TXSZ_VA48 | _TCR_CACHE_FLAGS | _TCR_SHARED | _TCR_TG_FLAGS | _TCR_ASID16 | _TCR_IPS_40BITS | _TCR_A1
 	reg.id = _KVM_ARM64_REGS_TCR_EL1
 	if err := c.setOneRegister(&reg); err != nil {
 		return err
@@ -103,7 +103,7 @@ func (c *vCPU) initArchState() error {
 	c.SetTtbr0Kvm(uintptr(data))
 
 	// ttbr1_el1
-	data = c.machine.kernel.PageTables.TTBR1_EL1(false, 0)
+	data = c.machine.kernel.PageTables.TTBR1_EL1(false, 1)
 
 	reg.id = _KVM_ARM64_REGS_TTBR1_EL1
 	if err := c.setOneRegister(&reg); err != nil {
@@ -159,7 +159,31 @@ func (c *vCPU) initArchState() error {
 	}
 
 	c.floatingPointState = arch.NewFloatingPointData()
+
+	return c.setSystemTime()
+}
+
+// setTSC sets the counter Virtual Offset.
+func (c *vCPU) setTSC(value uint64) error {
+	var (
+		reg  kvmOneReg
+		data uint64
+	)
+
+	reg.addr = uint64(reflect.ValueOf(&data).Pointer())
+	reg.id = _KVM_ARM64_REGS_TIMER_CNT
+	data = uint64(value)
+
+	if err := c.setOneRegister(&reg); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// setSystemTime sets the vCPU to the system time.
+func (c *vCPU) setSystemTime() error {
+	return c.setSystemTimeLegacy()
 }
 
 //go:nosplit
@@ -191,49 +215,13 @@ func (c *vCPU) getOneRegister(reg *kvmOneReg) error {
 	return nil
 }
 
-// setCPUID sets the CPUID to be used by the guest.
-func (c *vCPU) setCPUID() error {
-	return nil
-}
-
-// setSystemTime sets the TSC for the vCPU.
-func (c *vCPU) setSystemTime() error {
-	return nil
-}
-
-// setSignalMask sets the vCPU signal mask.
-//
-// This must be called prior to running the vCPU.
-func (c *vCPU) setSignalMask() error {
-	// The layout of this structure implies that it will not necessarily be
-	// the same layout chosen by the Go compiler. It gets fudged here.
-	var data struct {
-		length uint32
-		mask1  uint32
-		mask2  uint32
-		_      uint32
-	}
-	data.length = 8 // Fixed sigset size.
-	data.mask1 = ^uint32(bounceSignalMask & 0xffffffff)
-	data.mask2 = ^uint32(bounceSignalMask >> 32)
-	if _, _, errno := syscall.RawSyscall(
-		syscall.SYS_IOCTL,
-		uintptr(c.fd),
-		_KVM_SET_SIGNAL_MASK,
-		uintptr(unsafe.Pointer(&data))); errno != 0 {
-		return fmt.Errorf("error setting signal mask: %v", errno)
-	}
-
-	return nil
-}
-
 // SwitchToUser unpacks architectural-details.
 func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) (usermem.AccessType, error) {
 	// Check for canonical addresses.
 	if regs := switchOpts.Registers; !ring0.IsCanonical(regs.Pc) {
 		return nonCanonical(regs.Pc, int32(syscall.SIGSEGV), info)
 	} else if !ring0.IsCanonical(regs.Sp) {
-		return nonCanonical(regs.Sp, int32(syscall.SIGBUS), info)
+		return nonCanonical(regs.Sp, int32(syscall.SIGSEGV), info)
 	}
 
 	// Assign PCIDs.
@@ -271,8 +259,9 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) 
 		return c.fault(int32(syscall.SIGSEGV), info)
 	case ring0.Vector(bounce): // ring0.VirtualizationException
 		return usermem.NoAccess, platform.ErrContextInterrupt
-	case ring0.El0Sync_undef,
-		ring0.El1Sync_undef:
+	case ring0.El0Sync_undef:
+		return c.fault(int32(syscall.SIGILL), info)
+	case ring0.El1Sync_undef:
 		*info = arch.SignalInfo{
 			Signo: int32(syscall.SIGILL),
 			Code:  1, // ILL_ILLOPC (illegal opcode).

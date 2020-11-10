@@ -37,6 +37,8 @@ import (
 // to/from the kernel.
 //
 // SocketVFS2 implements socket.SocketVFS2 and transport.Credentialer.
+//
+// +stateify savable
 type SocketVFS2 struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -80,6 +82,13 @@ func NewVFS2(t *kernel.Task, skType linux.SockType, protocol Protocol) (*SocketV
 	}
 	fd.LockFD.Init(&vfs.FileLocks{})
 	return fd, nil
+}
+
+// Release implements vfs.FileDescriptionImpl.Release.
+func (s *SocketVFS2) Release(ctx context.Context) {
+	t := kernel.TaskFromContext(ctx)
+	t.Kernel().DeleteSocketVFS2(&s.vfsfd)
+	s.socketOpsCommon.Release(ctx)
 }
 
 // Readiness implements waiter.Waitable.Readiness.

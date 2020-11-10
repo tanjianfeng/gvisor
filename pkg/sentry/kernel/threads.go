@@ -36,6 +36,8 @@ import (
 const TasksLimit = (1 << 16)
 
 // ThreadID is a generic thread identifier.
+//
+// +marshal
 type ThreadID int32
 
 // String returns a decimal representation of the ThreadID.
@@ -261,6 +263,13 @@ func (ns *PIDNamespace) Tasks() []*Task {
 		tasks = append(tasks, t)
 	}
 	return tasks
+}
+
+// NumTasks returns the number of tasks in ns.
+func (ns *PIDNamespace) NumTasks() int {
+	ns.owner.mu.RLock()
+	defer ns.owner.mu.RUnlock()
+	return len(ns.tids)
 }
 
 // ThreadGroups returns a snapshot of the thread groups in ns.

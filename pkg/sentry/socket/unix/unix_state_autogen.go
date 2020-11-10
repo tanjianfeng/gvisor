@@ -6,59 +6,82 @@ import (
 	"gvisor.dev/gvisor/pkg/state"
 )
 
-func (x *socketOpsCommonRefs) StateTypeName() string {
-	return "pkg/sentry/socket/unix.socketOpsCommonRefs"
+func (r *socketOperationsRefs) StateTypeName() string {
+	return "pkg/sentry/socket/unix.socketOperationsRefs"
 }
 
-func (x *socketOpsCommonRefs) StateFields() []string {
+func (r *socketOperationsRefs) StateFields() []string {
 	return []string{
 		"refCount",
 	}
 }
 
-func (x *socketOpsCommonRefs) beforeSave() {}
+func (r *socketOperationsRefs) beforeSave() {}
 
-func (x *socketOpsCommonRefs) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.refCount)
+func (r *socketOperationsRefs) StateSave(stateSinkObject state.Sink) {
+	r.beforeSave()
+	stateSinkObject.Save(0, &r.refCount)
 }
 
-func (x *socketOpsCommonRefs) afterLoad() {}
-
-func (x *socketOpsCommonRefs) StateLoad(m state.Source) {
-	m.Load(0, &x.refCount)
+func (r *socketOperationsRefs) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &r.refCount)
+	stateSourceObject.AfterLoad(r.afterLoad)
 }
 
-func (x *SocketOperations) StateTypeName() string {
+func (r *socketVFS2Refs) StateTypeName() string {
+	return "pkg/sentry/socket/unix.socketVFS2Refs"
+}
+
+func (r *socketVFS2Refs) StateFields() []string {
+	return []string{
+		"refCount",
+	}
+}
+
+func (r *socketVFS2Refs) beforeSave() {}
+
+func (r *socketVFS2Refs) StateSave(stateSinkObject state.Sink) {
+	r.beforeSave()
+	stateSinkObject.Save(0, &r.refCount)
+}
+
+func (r *socketVFS2Refs) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &r.refCount)
+	stateSourceObject.AfterLoad(r.afterLoad)
+}
+
+func (s *SocketOperations) StateTypeName() string {
 	return "pkg/sentry/socket/unix.SocketOperations"
 }
 
-func (x *SocketOperations) StateFields() []string {
+func (s *SocketOperations) StateFields() []string {
 	return []string{
+		"socketOperationsRefs",
 		"socketOpsCommon",
 	}
 }
 
-func (x *SocketOperations) beforeSave() {}
+func (s *SocketOperations) beforeSave() {}
 
-func (x *SocketOperations) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.socketOpsCommon)
+func (s *SocketOperations) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	stateSinkObject.Save(0, &s.socketOperationsRefs)
+	stateSinkObject.Save(1, &s.socketOpsCommon)
 }
 
-func (x *SocketOperations) afterLoad() {}
+func (s *SocketOperations) afterLoad() {}
 
-func (x *SocketOperations) StateLoad(m state.Source) {
-	m.Load(0, &x.socketOpsCommon)
+func (s *SocketOperations) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &s.socketOperationsRefs)
+	stateSourceObject.Load(1, &s.socketOpsCommon)
 }
 
-func (x *socketOpsCommon) StateTypeName() string {
+func (s *socketOpsCommon) StateTypeName() string {
 	return "pkg/sentry/socket/unix.socketOpsCommon"
 }
 
-func (x *socketOpsCommon) StateFields() []string {
+func (s *socketOpsCommon) StateFields() []string {
 	return []string{
-		"socketOpsCommonRefs",
 		"SendReceiveTimeout",
 		"ep",
 		"stype",
@@ -67,31 +90,69 @@ func (x *socketOpsCommon) StateFields() []string {
 	}
 }
 
-func (x *socketOpsCommon) beforeSave() {}
+func (s *socketOpsCommon) beforeSave() {}
 
-func (x *socketOpsCommon) StateSave(m state.Sink) {
-	x.beforeSave()
-	m.Save(0, &x.socketOpsCommonRefs)
-	m.Save(1, &x.SendReceiveTimeout)
-	m.Save(2, &x.ep)
-	m.Save(3, &x.stype)
-	m.Save(4, &x.abstractName)
-	m.Save(5, &x.abstractNamespace)
+func (s *socketOpsCommon) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	stateSinkObject.Save(0, &s.SendReceiveTimeout)
+	stateSinkObject.Save(1, &s.ep)
+	stateSinkObject.Save(2, &s.stype)
+	stateSinkObject.Save(3, &s.abstractName)
+	stateSinkObject.Save(4, &s.abstractNamespace)
 }
 
-func (x *socketOpsCommon) afterLoad() {}
+func (s *socketOpsCommon) afterLoad() {}
 
-func (x *socketOpsCommon) StateLoad(m state.Source) {
-	m.Load(0, &x.socketOpsCommonRefs)
-	m.Load(1, &x.SendReceiveTimeout)
-	m.Load(2, &x.ep)
-	m.Load(3, &x.stype)
-	m.Load(4, &x.abstractName)
-	m.Load(5, &x.abstractNamespace)
+func (s *socketOpsCommon) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &s.SendReceiveTimeout)
+	stateSourceObject.Load(1, &s.ep)
+	stateSourceObject.Load(2, &s.stype)
+	stateSourceObject.Load(3, &s.abstractName)
+	stateSourceObject.Load(4, &s.abstractNamespace)
+}
+
+func (s *SocketVFS2) StateTypeName() string {
+	return "pkg/sentry/socket/unix.SocketVFS2"
+}
+
+func (s *SocketVFS2) StateFields() []string {
+	return []string{
+		"vfsfd",
+		"FileDescriptionDefaultImpl",
+		"DentryMetadataFileDescriptionImpl",
+		"LockFD",
+		"socketVFS2Refs",
+		"socketOpsCommon",
+	}
+}
+
+func (s *SocketVFS2) beforeSave() {}
+
+func (s *SocketVFS2) StateSave(stateSinkObject state.Sink) {
+	s.beforeSave()
+	stateSinkObject.Save(0, &s.vfsfd)
+	stateSinkObject.Save(1, &s.FileDescriptionDefaultImpl)
+	stateSinkObject.Save(2, &s.DentryMetadataFileDescriptionImpl)
+	stateSinkObject.Save(3, &s.LockFD)
+	stateSinkObject.Save(4, &s.socketVFS2Refs)
+	stateSinkObject.Save(5, &s.socketOpsCommon)
+}
+
+func (s *SocketVFS2) afterLoad() {}
+
+func (s *SocketVFS2) StateLoad(stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &s.vfsfd)
+	stateSourceObject.Load(1, &s.FileDescriptionDefaultImpl)
+	stateSourceObject.Load(2, &s.DentryMetadataFileDescriptionImpl)
+	stateSourceObject.Load(3, &s.LockFD)
+	stateSourceObject.Load(4, &s.socketVFS2Refs)
+	stateSourceObject.Load(5, &s.socketOpsCommon)
 }
 
 func init() {
-	state.Register((*socketOpsCommonRefs)(nil))
+	state.Register((*socketOperationsRefs)(nil))
+	state.Register((*socketVFS2Refs)(nil))
 	state.Register((*SocketOperations)(nil))
 	state.Register((*socketOpsCommon)(nil))
+	state.Register((*SocketVFS2)(nil))
 }

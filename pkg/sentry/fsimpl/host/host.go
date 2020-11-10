@@ -19,6 +19,7 @@ package host
 import (
 	"fmt"
 	"math"
+	"sync/atomic"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -40,34 +41,97 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-func newInode(fs *filesystem, hostFD int, fileType linux.FileMode, isTTY bool) (*inode, error) {
-	// Determine if hostFD is seekable. If not, this syscall will return ESPIPE
-	// (see fs/read_write.c:llseek), e.g. for pipes, sockets, and some character
-	// devices.
+// inode implements kernfs.Inode.
+//
+// +stateify savable
+type inode struct {
+	kernfs.InodeNoStatFS
+	kernfs.InodeNotDirectory
+	kernfs.InodeNotSymlink
+	kernfs.CachedMappable
+	kernfs.InodeTemporary // This holds no meaning as this inode can't be Looked up and is always valid.
+
+	locks vfs.FileLocks
+
+	// When the reference count reaches zero, the host fd is closed.
+	inodeRefs
+
+	// hostFD contains the host fd that this file was originally created from,
+	// which must be available at time of restore.
+	//
+	// This field is initialized at creation time and is immutable.
+	hostFD int
+
+	// ino is an inode number unique within this filesystem.
+	//
+	// This field is initialized at creation time and is immutable.
+	ino uint64
+
+	// ftype is the file's type (a linux.S_IFMT mask).
+	//
+	// This field is initialized at creation time and is immutable.
+	ftype uint16
+
+	// mayBlock is true if hostFD is non-blocking, and operations on it may
+	// return EAGAIN or EWOULDBLOCK instead of blocking.
+	//
+	// This field is initialized at creation time and is immutable.
+	mayBlock bool
+
+	// seekable is false if lseek(hostFD) returns ESPIPE. We assume that file
+	// offsets are meaningful iff seekable is true.
+	//
+	// This field is initialized at creation time and is immutable.
+	seekable bool
+
+	// isTTY is true if this file represents a TTY.
+	//
+	// This field is initialized at creation time and is immutable.
+	isTTY bool
+
+	// savable is true if hostFD may be saved/restored by its numeric value.
+	//
+	// This field is initialized at creation time and is immutable.
+	savable bool
+
+	// Event queue for blocking operations.
+	queue waiter.Queue
+
+	// If haveBuf is non-zero, hostFD represents a pipe, and buf contains data
+	// read from the pipe from previous calls to inode.beforeSave(). haveBuf
+	// and buf are protected by bufMu. haveBuf is accessed using atomic memory
+	// operations.
+	bufMu   sync.Mutex `state:"nosave"`
+	haveBuf uint32
+	buf     []byte
+}
+
+func newInode(ctx context.Context, fs *filesystem, hostFD int, savable bool, fileType linux.FileMode, isTTY bool) (*inode, error) {
+	// Determine if hostFD is seekable.
 	_, err := unix.Seek(hostFD, 0, linux.SEEK_CUR)
 	seekable := err != syserror.ESPIPE
+	// We expect regular files to be seekable, as this is required for them to
+	// be memory-mappable.
+	if !seekable && fileType == syscall.S_IFREG {
+		ctx.Infof("host.newInode: host FD %d is a non-seekable regular file", hostFD)
+		return nil, syserror.ESPIPE
+	}
 
 	i := &inode{
-		hostFD:     hostFD,
-		ino:        fs.NextIno(),
-		isTTY:      isTTY,
-		wouldBlock: wouldBlock(uint32(fileType)),
-		seekable:   seekable,
-		// NOTE(b/38213152): Technically, some obscure char devices can be memory
-		// mapped, but we only allow regular files.
-		canMap: fileType == linux.S_IFREG,
+		hostFD:   hostFD,
+		ino:      fs.NextIno(),
+		ftype:    uint16(fileType),
+		mayBlock: fileType != syscall.S_IFREG && fileType != syscall.S_IFDIR,
+		seekable: seekable,
+		isTTY:    isTTY,
+		savable:  savable,
 	}
-	i.pf.inode = i
-	i.refs.EnableLeakCheck()
+	i.CachedMappable.Init(hostFD)
+	i.EnableLeakCheck()
 
-	// Non-seekable files can't be memory mapped, assert this.
-	if !i.seekable && i.canMap {
-		panic("files that can return EWOULDBLOCK (sockets, pipes, etc.) cannot be memory mapped")
-	}
-
-	// If the hostFD would block, we must set it to non-blocking and handle
-	// blocking behavior in the sentry.
-	if i.wouldBlock {
+	// If the hostFD can return EWOULDBLOCK when set to non-blocking, do so and
+	// handle blocking behavior in the sentry.
+	if i.mayBlock {
 		if err := syscall.SetNonblock(i.hostFD, true); err != nil {
 			return nil, err
 		}
@@ -80,6 +144,11 @@ func newInode(fs *filesystem, hostFD int, fileType linux.FileMode, isTTY bool) (
 
 // NewFDOptions contains options to NewFD.
 type NewFDOptions struct {
+	// If Savable is true, the host file descriptor may be saved/restored by
+	// numeric value; the sandbox API requires a corresponding host FD with the
+	// same numeric value to be provieded at time of restore.
+	Savable bool
+
 	// If IsTTY is true, the file descriptor is a TTY.
 	IsTTY bool
 
@@ -114,11 +183,11 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 	}
 
 	d := &kernfs.Dentry{}
-	i, err := newInode(fs, hostFD, linux.FileMode(s.Mode).FileType(), opts.IsTTY)
+	i, err := newInode(ctx, fs, hostFD, opts.Savable, linux.FileMode(s.Mode).FileType(), opts.IsTTY)
 	if err != nil {
 		return nil, err
 	}
-	d.Init(i)
+	d.Init(&fs.Filesystem, i)
 
 	// i.open will take a reference on d.
 	defer d.DecRef(ctx)
@@ -126,28 +195,34 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 	// For simplicity, fileDescription.offset is set to 0. Technically, we
 	// should only set to 0 on files that are not seekable (sockets, pipes,
 	// etc.), and use the offset from the host fd otherwise when importing.
-	return i.open(ctx, d.VFSDentry(), mnt, flags)
+	return i.open(ctx, d, mnt, flags)
 }
 
 // ImportFD sets up and returns a vfs.FileDescription from a donated fd.
 func ImportFD(ctx context.Context, mnt *vfs.Mount, hostFD int, isTTY bool) (*vfs.FileDescription, error) {
 	return NewFD(ctx, mnt, hostFD, &NewFDOptions{
-		IsTTY: isTTY,
+		Savable: true,
+		IsTTY:   isTTY,
 	})
 }
 
 // filesystemType implements vfs.FilesystemType.
+//
+// +stateify savable
 type filesystemType struct{}
 
-// GetFilesystem implements FilesystemType.GetFilesystem.
+// GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (filesystemType) GetFilesystem(context.Context, *vfs.VirtualFilesystem, *auth.Credentials, string, vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
 	panic("host.filesystemType.GetFilesystem should never be called")
 }
 
-// Name implements FilesystemType.Name.
+// Name implements vfs.FilesystemType.Name.
 func (filesystemType) Name() string {
 	return "none"
 }
+
+// Release implements vfs.FilesystemType.Release.
+func (filesystemType) Release(ctx context.Context) {}
 
 // NewFilesystem sets up and returns a new hostfs filesystem.
 //
@@ -166,6 +241,8 @@ func NewFilesystem(vfsObj *vfs.VirtualFilesystem) (*vfs.Filesystem, error) {
 }
 
 // filesystem implements vfs.FilesystemImpl.
+//
+// +stateify savable
 type filesystem struct {
 	kernfs.Filesystem
 
@@ -184,65 +261,7 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 	return vfs.PrependPathSyntheticError{}
 }
 
-// inode implements kernfs.Inode.
-type inode struct {
-	kernfs.InodeNotDirectory
-	kernfs.InodeNotSymlink
-
-	locks vfs.FileLocks
-
-	// When the reference count reaches zero, the host fd is closed.
-	refs inodeRefs
-
-	// hostFD contains the host fd that this file was originally created from,
-	// which must be available at time of restore.
-	//
-	// This field is initialized at creation time and is immutable.
-	hostFD int
-
-	// ino is an inode number unique within this filesystem.
-	//
-	// This field is initialized at creation time and is immutable.
-	ino uint64
-
-	// isTTY is true if this file represents a TTY.
-	//
-	// This field is initialized at creation time and is immutable.
-	isTTY bool
-
-	// seekable is false if the host fd points to a file representing a stream,
-	// e.g. a socket or a pipe. Such files are not seekable and can return
-	// EWOULDBLOCK for I/O operations.
-	//
-	// This field is initialized at creation time and is immutable.
-	seekable bool
-
-	// wouldBlock is true if the host FD would return EWOULDBLOCK for
-	// operations that would block.
-	//
-	// This field is initialized at creation time and is immutable.
-	wouldBlock bool
-
-	// Event queue for blocking operations.
-	queue waiter.Queue
-
-	// canMap specifies whether we allow the file to be memory mapped.
-	//
-	// This field is initialized at creation time and is immutable.
-	canMap bool
-
-	// mapsMu protects mappings.
-	mapsMu sync.Mutex
-
-	// If canMap is true, mappings tracks mappings of hostFD into
-	// memmap.MappingSpaces.
-	mappings memmap.MappingSet
-
-	// pf implements platform.File for mappings of hostFD.
-	pf inodePlatformFile
-}
-
-// CheckPermissions implements kernfs.Inode.
+// CheckPermissions implements kernfs.Inode.CheckPermissions.
 func (i *inode) CheckPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
 	var s syscall.Stat_t
 	if err := syscall.Fstat(i.hostFD, &s); err != nil {
@@ -251,7 +270,7 @@ func (i *inode) CheckPermissions(ctx context.Context, creds *auth.Credentials, a
 	return vfs.GenericCheckPermissions(creds, ats, linux.FileMode(s.Mode), auth.KUID(s.Uid), auth.KGID(s.Gid))
 }
 
-// Mode implements kernfs.Inode.
+// Mode implements kernfs.Inode.Mode.
 func (i *inode) Mode() linux.FileMode {
 	var s syscall.Stat_t
 	if err := syscall.Fstat(i.hostFD, &s); err != nil {
@@ -262,7 +281,7 @@ func (i *inode) Mode() linux.FileMode {
 	return linux.FileMode(s.Mode)
 }
 
-// Stat implements kernfs.Inode.
+// Stat implements kernfs.Inode.Stat.
 func (i *inode) Stat(ctx context.Context, vfsfs *vfs.Filesystem, opts vfs.StatOptions) (linux.Statx, error) {
 	if opts.Mask&linux.STATX__RESERVED != 0 {
 		return linux.Statx{}, syserror.EINVAL
@@ -375,7 +394,7 @@ func (i *inode) fstat(fs *filesystem) (linux.Statx, error) {
 	}, nil
 }
 
-// SetStat implements kernfs.Inode.
+// SetStat implements kernfs.Inode.SetStat.
 func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Credentials, opts vfs.SetStatOptions) error {
 	s := &opts.Stat
 
@@ -411,14 +430,7 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 			oldpgend, _ := usermem.PageRoundUp(oldSize)
 			newpgend, _ := usermem.PageRoundUp(s.Size)
 			if oldpgend != newpgend {
-				i.mapsMu.Lock()
-				i.mappings.Invalidate(memmap.MappableRange{newpgend, oldpgend}, memmap.InvalidateOpts{
-					// Compare Linux's mm/truncate.c:truncate_setsize() =>
-					// truncate_pagecache() =>
-					// mm/memory.c:unmap_mapping_range(evencows=1).
-					InvalidatePrivate: true,
-				})
-				i.mapsMu.Unlock()
+				i.CachedMappable.InvalidateRange(memmap.MappableRange{newpgend, oldpgend})
 			}
 		}
 	}
@@ -434,20 +446,10 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 	return nil
 }
 
-// IncRef implements kernfs.Inode.
-func (i *inode) IncRef() {
-	i.refs.IncRef()
-}
-
-// TryIncRef implements kernfs.Inode.
-func (i *inode) TryIncRef() bool {
-	return i.refs.TryIncRef()
-}
-
-// DecRef implements kernfs.Inode.
+// DecRef implements kernfs.Inode.DecRef.
 func (i *inode) DecRef(ctx context.Context) {
-	i.refs.DecRef(func() {
-		if i.wouldBlock {
+	i.inodeRefs.DecRef(func() {
+		if i.mayBlock {
 			fdnotifier.RemoveFD(int32(i.hostFD))
 		}
 		if err := unix.Close(i.hostFD); err != nil {
@@ -456,16 +458,16 @@ func (i *inode) DecRef(ctx context.Context) {
 	})
 }
 
-// Open implements kernfs.Inode.
-func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+// Open implements kernfs.Inode.Open.
+func (i *inode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	// Once created, we cannot re-open a socket fd through /proc/[pid]/fd/.
 	if i.Mode().FileType() == linux.S_IFSOCK {
 		return nil, syserror.ENXIO
 	}
-	return i.open(ctx, vfsd, rp.Mount(), opts.Flags)
+	return i.open(ctx, d, rp.Mount(), opts.Flags)
 }
 
-func (i *inode) open(ctx context.Context, d *vfs.Dentry, mnt *vfs.Mount, flags uint32) (*vfs.FileDescription, error) {
+func (i *inode) open(ctx context.Context, d *kernfs.Dentry, mnt *vfs.Mount, flags uint32) (*vfs.FileDescription, error) {
 	var s syscall.Stat_t
 	if err := syscall.Fstat(i.hostFD, &s); err != nil {
 		return nil, err
@@ -489,17 +491,17 @@ func (i *inode) open(ctx context.Context, d *vfs.Dentry, mnt *vfs.Mount, flags u
 			return nil, err
 		}
 		// Currently, we only allow Unix sockets to be imported.
-		return unixsocket.NewFileDescription(ep, ep.Type(), flags, mnt, d, &i.locks)
+		return unixsocket.NewFileDescription(ep, ep.Type(), flags, mnt, d.VFSDentry(), &i.locks)
 
 	case syscall.S_IFREG, syscall.S_IFIFO, syscall.S_IFCHR:
 		if i.isTTY {
 			fd := &TTYFileDescription{
 				fileDescription: fileDescription{inode: i},
-				termios:         linux.DefaultSlaveTermios,
+				termios:         linux.DefaultReplicaTermios,
 			}
 			fd.LockFD.Init(&i.locks)
 			vfsfd := &fd.vfsfd
-			if err := vfsfd.Init(fd, flags, mnt, d, &vfs.FileDescriptionOptions{}); err != nil {
+			if err := vfsfd.Init(fd, flags, mnt, d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
 				return nil, err
 			}
 			return vfsfd, nil
@@ -508,7 +510,7 @@ func (i *inode) open(ctx context.Context, d *vfs.Dentry, mnt *vfs.Mount, flags u
 		fd := &fileDescription{inode: i}
 		fd.LockFD.Init(&i.locks)
 		vfsfd := &fd.vfsfd
-		if err := vfsfd.Init(fd, flags, mnt, d, &vfs.FileDescriptionOptions{}); err != nil {
+		if err := vfsfd.Init(fd, flags, mnt, d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
 			return nil, err
 		}
 		return vfsfd, nil
@@ -520,6 +522,8 @@ func (i *inode) open(ctx context.Context, d *vfs.Dentry, mnt *vfs.Mount, flags u
 }
 
 // fileDescription is embedded by host fd implementations of FileDescriptionImpl.
+//
+// +stateify savable
 type fileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -534,41 +538,43 @@ type fileDescription struct {
 	inode *inode
 
 	// offsetMu protects offset.
-	offsetMu sync.Mutex
+	offsetMu sync.Mutex `state:"nosave"`
 
 	// offset specifies the current file offset. It is only meaningful when
 	// inode.seekable is true.
 	offset int64
 }
 
-// SetStat implements vfs.FileDescriptionImpl.
+// SetStat implements vfs.FileDescriptionImpl.SetStat.
 func (f *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
 	creds := auth.CredentialsFromContext(ctx)
 	return f.inode.SetStat(ctx, f.vfsfd.Mount().Filesystem(), creds, opts)
 }
 
-// Stat implements vfs.FileDescriptionImpl.
+// Stat implements vfs.FileDescriptionImpl.Stat.
 func (f *fileDescription) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, error) {
 	return f.inode.Stat(ctx, f.vfsfd.Mount().Filesystem(), opts)
 }
 
-// Release implements vfs.FileDescriptionImpl.
+// Release implements vfs.FileDescriptionImpl.Release.
 func (f *fileDescription) Release(context.Context) {
 	// noop
 }
 
-// Allocate implements vfs.FileDescriptionImpl.
+// Allocate implements vfs.FileDescriptionImpl.Allocate.
 func (f *fileDescription) Allocate(ctx context.Context, mode, offset, length uint64) error {
-	if !f.inode.seekable {
-		return syserror.ESPIPE
-	}
-
-	// TODO(gvisor.dev/issue/3589): Implement Allocate for non-pipe hostfds.
-	return syserror.EOPNOTSUPP
+	return unix.Fallocate(f.inode.hostFD, uint32(mode), int64(offset), int64(length))
 }
 
-// PRead implements FileDescriptionImpl.
+// PRead implements vfs.FileDescriptionImpl.PRead.
 func (f *fileDescription) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
+	// Check that flags are supported.
+	//
+	// TODO(gvisor.dev/issue/2601): Support select preadv2 flags.
+	if opts.Flags&^linux.RWF_HIPRI != 0 {
+		return 0, syserror.EOPNOTSUPP
+	}
+
 	i := f.inode
 	if !i.seekable {
 		return 0, syserror.ESPIPE
@@ -577,21 +583,33 @@ func (f *fileDescription) PRead(ctx context.Context, dst usermem.IOSequence, off
 	return readFromHostFD(ctx, i.hostFD, dst, offset, opts.Flags)
 }
 
-// Read implements FileDescriptionImpl.
+// Read implements vfs.FileDescriptionImpl.Read.
 func (f *fileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
+	// Check that flags are supported.
+	//
+	// TODO(gvisor.dev/issue/2601): Support select preadv2 flags.
+	if opts.Flags&^linux.RWF_HIPRI != 0 {
+		return 0, syserror.EOPNOTSUPP
+	}
+
 	i := f.inode
 	if !i.seekable {
+		bufN, err := i.readFromBuf(ctx, &dst)
+		if err != nil {
+			return bufN, err
+		}
 		n, err := readFromHostFD(ctx, i.hostFD, dst, -1, opts.Flags)
+		total := bufN + n
 		if isBlockError(err) {
 			// If we got any data at all, return it as a "completed" partial read
 			// rather than retrying until complete.
-			if n != 0 {
+			if total != 0 {
 				err = nil
 			} else {
 				err = syserror.ErrWouldBlock
 			}
 		}
-		return n, err
+		return total, err
 	}
 
 	f.offsetMu.Lock()
@@ -601,20 +619,33 @@ func (f *fileDescription) Read(ctx context.Context, dst usermem.IOSequence, opts
 	return n, err
 }
 
-func readFromHostFD(ctx context.Context, hostFD int, dst usermem.IOSequence, offset int64, flags uint32) (int64, error) {
-	// Check that flags are supported.
-	//
-	// TODO(gvisor.dev/issue/2601): Support select preadv2 flags.
-	if flags&^linux.RWF_HIPRI != 0 {
-		return 0, syserror.EOPNOTSUPP
+func (i *inode) readFromBuf(ctx context.Context, dst *usermem.IOSequence) (int64, error) {
+	if atomic.LoadUint32(&i.haveBuf) == 0 {
+		return 0, nil
 	}
+	i.bufMu.Lock()
+	defer i.bufMu.Unlock()
+	if len(i.buf) == 0 {
+		return 0, nil
+	}
+	n, err := dst.CopyOut(ctx, i.buf)
+	*dst = dst.DropFirst(n)
+	i.buf = i.buf[n:]
+	if len(i.buf) == 0 {
+		atomic.StoreUint32(&i.haveBuf, 0)
+		i.buf = nil
+	}
+	return int64(n), err
+}
+
+func readFromHostFD(ctx context.Context, hostFD int, dst usermem.IOSequence, offset int64, flags uint32) (int64, error) {
 	reader := hostfd.GetReadWriterAt(int32(hostFD), offset, flags)
 	n, err := dst.CopyOutFrom(ctx, reader)
 	hostfd.PutReadWriterAt(reader)
 	return int64(n), err
 }
 
-// PWrite implements FileDescriptionImpl.
+// PWrite implements vfs.FileDescriptionImpl.PWrite.
 func (f *fileDescription) PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts vfs.WriteOptions) (int64, error) {
 	if !f.inode.seekable {
 		return 0, syserror.ESPIPE
@@ -623,7 +654,7 @@ func (f *fileDescription) PWrite(ctx context.Context, src usermem.IOSequence, of
 	return f.writeToHostFD(ctx, src, offset, opts.Flags)
 }
 
-// Write implements FileDescriptionImpl.
+// Write implements vfs.FileDescriptionImpl.Write.
 func (f *fileDescription) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
 	i := f.inode
 	if !i.seekable {
@@ -671,7 +702,7 @@ func (f *fileDescription) writeToHostFD(ctx context.Context, src usermem.IOSeque
 	return int64(n), err
 }
 
-// Seek implements FileDescriptionImpl.
+// Seek implements vfs.FileDescriptionImpl.Seek.
 //
 // Note that we do not support seeking on directories, since we do not even
 // allow directory fds to be imported at all.
@@ -736,32 +767,38 @@ func (f *fileDescription) Seek(_ context.Context, offset int64, whence int32) (i
 	return f.offset, nil
 }
 
-// Sync implements FileDescriptionImpl.
-func (f *fileDescription) Sync(context.Context) error {
+// Sync implements vfs.FileDescriptionImpl.Sync.
+func (f *fileDescription) Sync(ctx context.Context) error {
 	// TODO(gvisor.dev/issue/1897): Currently, we always sync everything.
 	return unix.Fsync(f.inode.hostFD)
 }
 
-// ConfigureMMap implements FileDescriptionImpl.
+// ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
 func (f *fileDescription) ConfigureMMap(_ context.Context, opts *memmap.MMapOpts) error {
-	if !f.inode.canMap {
+	// NOTE(b/38213152): Technically, some obscure char devices can be memory
+	// mapped, but we only allow regular files.
+	if f.inode.ftype != syscall.S_IFREG {
 		return syserror.ENODEV
 	}
 	i := f.inode
-	i.pf.fileMapperInitOnce.Do(i.pf.fileMapper.Init)
+	i.CachedMappable.InitFileMapperOnce()
 	return vfs.GenericConfigureMMap(&f.vfsfd, i, opts)
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
 func (f *fileDescription) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
 	f.inode.queue.EventRegister(e, mask)
-	fdnotifier.UpdateFD(int32(f.inode.hostFD))
+	if f.inode.mayBlock {
+		fdnotifier.UpdateFD(int32(f.inode.hostFD))
+	}
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
 func (f *fileDescription) EventUnregister(e *waiter.Entry) {
 	f.inode.queue.EventUnregister(e)
-	fdnotifier.UpdateFD(int32(f.inode.hostFD))
+	if f.inode.mayBlock {
+		fdnotifier.UpdateFD(int32(f.inode.hostFD))
+	}
 }
 
 // Readiness uses the poll() syscall to check the status of the underlying FD.

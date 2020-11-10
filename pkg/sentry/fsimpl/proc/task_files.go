@@ -31,6 +31,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -247,13 +248,10 @@ type commInode struct {
 	task *kernel.Task
 }
 
-func (fs *filesystem) newComm(task *kernel.Task, ino uint64, perm linux.FileMode) *kernfs.Dentry {
+func (fs *filesystem) newComm(task *kernel.Task, ino uint64, perm linux.FileMode) kernfs.Inode {
 	inode := &commInode{task: task}
-	inode.DynamicBytesFile.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, &commData{task: task}, perm)
-
-	d := &kernfs.Dentry{}
-	d.Init(inode)
-	return d
+	inode.DynamicBytesFile.Init(task, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, &commData{task: task}, perm)
+	return inode
 }
 
 func (i *commInode) CheckPermissions(ctx context.Context, creds *auth.Credentials, ats vfs.AccessTypes) error {
@@ -367,6 +365,162 @@ func (d *idMapData) Write(ctx context.Context, src usermem.IOSequence, offset in
 	// On success, Linux's kernel/user_namespace.c:map_write() always returns
 	// count, even if fewer bytes were used.
 	return int64(srclen), nil
+}
+
+var _ kernfs.Inode = (*memInode)(nil)
+
+// memInode implements kernfs.Inode for /proc/[pid]/mem.
+//
+// +stateify savable
+type memInode struct {
+	kernfs.InodeAttrs
+	kernfs.InodeNoStatFS
+	kernfs.InodeNoopRefCount
+	kernfs.InodeNotDirectory
+	kernfs.InodeNotSymlink
+
+	task  *kernel.Task
+	locks vfs.FileLocks
+}
+
+func (fs *filesystem) newMemInode(task *kernel.Task, ino uint64, perm linux.FileMode) kernfs.Inode {
+	// Note: credentials are overridden by taskOwnedInode.
+	inode := &memInode{task: task}
+	inode.init(task, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, perm)
+	return &taskOwnedInode{Inode: inode, owner: task}
+}
+
+func (f *memInode) init(ctx context.Context, creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode) {
+	if perm&^linux.PermissionsMask != 0 {
+		panic(fmt.Sprintf("Only permission mask must be set: %x", perm&linux.PermissionsMask))
+	}
+	f.InodeAttrs.Init(ctx, creds, devMajor, devMinor, ino, linux.ModeRegular|perm)
+}
+
+// Open implements kernfs.Inode.Open.
+func (f *memInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	// TODO(gvisor.dev/issue/260): Add check for PTRACE_MODE_ATTACH_FSCREDS
+	// Permission to read this file is governed by PTRACE_MODE_ATTACH_FSCREDS
+	// Since we dont implement setfsuid/setfsgid we can just use PTRACE_MODE_ATTACH
+	if !kernel.ContextCanTrace(ctx, f.task, true) {
+		return nil, syserror.EACCES
+	}
+	if err := checkTaskState(f.task); err != nil {
+		return nil, err
+	}
+	fd := &memFD{}
+	if err := fd.Init(rp.Mount(), d, f, opts.Flags); err != nil {
+		return nil, err
+	}
+	return &fd.vfsfd, nil
+}
+
+// SetStat implements kernfs.Inode.SetStat.
+func (*memInode) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, vfs.SetStatOptions) error {
+	return syserror.EPERM
+}
+
+var _ vfs.FileDescriptionImpl = (*memFD)(nil)
+
+// memFD implements vfs.FileDescriptionImpl for /proc/[pid]/mem.
+//
+// +stateify savable
+type memFD struct {
+	vfsfd vfs.FileDescription
+	vfs.FileDescriptionDefaultImpl
+	vfs.LockFD
+
+	inode *memInode
+
+	// mu guards the fields below.
+	mu     sync.Mutex `state:"nosave"`
+	offset int64
+}
+
+// Init initializes memFD.
+func (fd *memFD) Init(m *vfs.Mount, d *kernfs.Dentry, inode *memInode, flags uint32) error {
+	fd.LockFD.Init(&inode.locks)
+	if err := fd.vfsfd.Init(fd, flags, m, d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
+		return err
+	}
+	fd.inode = inode
+	return nil
+}
+
+// Seek implements vfs.FileDescriptionImpl.Seek.
+func (fd *memFD) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
+	fd.mu.Lock()
+	defer fd.mu.Unlock()
+	switch whence {
+	case linux.SEEK_SET:
+	case linux.SEEK_CUR:
+		offset += fd.offset
+	default:
+		return 0, syserror.EINVAL
+	}
+	if offset < 0 {
+		return 0, syserror.EINVAL
+	}
+	fd.offset = offset
+	return offset, nil
+}
+
+// PRead implements vfs.FileDescriptionImpl.PRead.
+func (fd *memFD) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
+	if dst.NumBytes() == 0 {
+		return 0, nil
+	}
+	m, err := getMMIncRef(fd.inode.task)
+	if err != nil {
+		return 0, nil
+	}
+	defer m.DecUsers(ctx)
+	// Buffer the read data because of MM locks
+	buf := make([]byte, dst.NumBytes())
+	n, readErr := m.CopyIn(ctx, usermem.Addr(offset), buf, usermem.IOOpts{IgnorePermissions: true})
+	if n > 0 {
+		if _, err := dst.CopyOut(ctx, buf[:n]); err != nil {
+			return 0, syserror.EFAULT
+		}
+		return int64(n), nil
+	}
+	if readErr != nil {
+		return 0, syserror.EIO
+	}
+	return 0, nil
+}
+
+// Read implements vfs.FileDescriptionImpl.Read.
+func (fd *memFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
+	fd.mu.Lock()
+	n, err := fd.PRead(ctx, dst, fd.offset, opts)
+	fd.offset += n
+	fd.mu.Unlock()
+	return n, err
+}
+
+// Stat implements vfs.FileDescriptionImpl.Stat.
+func (fd *memFD) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, error) {
+	fs := fd.vfsfd.VirtualDentry().Mount().Filesystem()
+	return fd.inode.Stat(ctx, fs, opts)
+}
+
+// SetStat implements vfs.FileDescriptionImpl.SetStat.
+func (fd *memFD) SetStat(context.Context, vfs.SetStatOptions) error {
+	return syserror.EPERM
+}
+
+// Release implements vfs.FileDescriptionImpl.Release.
+func (fd *memFD) Release(context.Context) {}
+
+// LockPOSIX implements vfs.FileDescriptionImpl.LockPOSIX.
+func (fd *memFD) LockPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, start, length uint64, whence int16, block fslock.Blocker) error {
+	return fd.Locks().LockPOSIX(ctx, &fd.vfsfd, uid, t, start, length, whence, block)
+}
+
+// UnlockPOSIX implements vfs.FileDescriptionImpl.UnlockPOSIX.
+func (fd *memFD) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, start, length uint64, whence int16) error {
+	return fd.Locks().UnlockPOSIX(ctx, &fd.vfsfd, uid, start, length, whence)
 }
 
 // mapsData implements vfs.DynamicBytesSource for /proc/[pid]/maps.
@@ -543,7 +697,7 @@ func (s *statusData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	var vss, rss, data uint64
 	s.task.WithMuLocked(func(t *kernel.Task) {
 		if fdTable := t.FDTable(); fdTable != nil {
-			fds = fdTable.Size()
+			fds = fdTable.CurrentMaxFDs()
 		}
 		if mm := t.MemoryManager(); mm != nil {
 			vss = mm.VirtualMemorySize()
@@ -648,6 +802,7 @@ func (o *oomScoreAdj) Write(ctx context.Context, src usermem.IOSequence, offset 
 //
 // +stateify savable
 type exeSymlink struct {
+	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
 	kernfs.InodeSymlink
@@ -657,29 +812,30 @@ type exeSymlink struct {
 
 var _ kernfs.Inode = (*exeSymlink)(nil)
 
-func (fs *filesystem) newExeSymlink(task *kernel.Task, ino uint64) *kernfs.Dentry {
+func (fs *filesystem) newExeSymlink(task *kernel.Task, ino uint64) kernfs.Inode {
 	inode := &exeSymlink{task: task}
-	inode.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
-
-	d := &kernfs.Dentry{}
-	d.Init(inode)
-	return d
+	inode.Init(task, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
+	return inode
 }
 
-// Readlink implements kernfs.Inode.
-func (s *exeSymlink) Readlink(ctx context.Context) (string, error) {
-	if !kernel.ContextCanTrace(ctx, s.task, false) {
-		return "", syserror.EACCES
-	}
-
-	// Pull out the executable for /proc/[pid]/exe.
-	exec, err := s.executable()
+// Readlink implements kernfs.Inode.Readlink.
+func (s *exeSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error) {
+	exec, _, err := s.Getlink(ctx, nil)
 	if err != nil {
 		return "", err
 	}
 	defer exec.DecRef(ctx)
 
-	return exec.PathnameWithDeleted(ctx), nil
+	root := vfs.RootFromContext(ctx)
+	if !root.Ok() {
+		// It could have raced with process deletion.
+		return "", syserror.ESRCH
+	}
+	defer root.DecRef(ctx)
+
+	vfsObj := exec.Mount().Filesystem().VirtualFilesystem()
+	name, _ := vfsObj.PathnameWithDeleted(ctx, root, exec)
+	return name, nil
 }
 
 // Getlink implements kernfs.Inode.Getlink.
@@ -687,23 +843,12 @@ func (s *exeSymlink) Getlink(ctx context.Context, _ *vfs.Mount) (vfs.VirtualDent
 	if !kernel.ContextCanTrace(ctx, s.task, false) {
 		return vfs.VirtualDentry{}, "", syserror.EACCES
 	}
-
-	exec, err := s.executable()
-	if err != nil {
+	if err := checkTaskState(s.task); err != nil {
 		return vfs.VirtualDentry{}, "", err
 	}
-	defer exec.DecRef(ctx)
 
-	vd := exec.(*fsbridge.VFSFile).FileDescription().VirtualDentry()
-	vd.IncRef()
-	return vd, "", nil
-}
-
-func (s *exeSymlink) executable() (file fsbridge.File, err error) {
-	if err := checkTaskState(s.task); err != nil {
-		return nil, err
-	}
-
+	var err error
+	var exec fsbridge.File
 	s.task.WithMuLocked(func(t *kernel.Task) {
 		mm := t.MemoryManager()
 		if mm == nil {
@@ -714,12 +859,75 @@ func (s *exeSymlink) executable() (file fsbridge.File, err error) {
 		// The MemoryManager may be destroyed, in which case
 		// MemoryManager.destroy will simply set the executable to nil
 		// (with locks held).
-		file = mm.Executable()
-		if file == nil {
+		exec = mm.Executable()
+		if exec == nil {
 			err = syserror.ESRCH
 		}
 	})
-	return
+	if err != nil {
+		return vfs.VirtualDentry{}, "", err
+	}
+	defer exec.DecRef(ctx)
+
+	vd := exec.(*fsbridge.VFSFile).FileDescription().VirtualDentry()
+	vd.IncRef()
+	return vd, "", nil
+}
+
+// cwdSymlink is an symlink for the /proc/[pid]/cwd file.
+//
+// +stateify savable
+type cwdSymlink struct {
+	implStatFS
+	kernfs.InodeAttrs
+	kernfs.InodeNoopRefCount
+	kernfs.InodeSymlink
+
+	task *kernel.Task
+}
+
+var _ kernfs.Inode = (*cwdSymlink)(nil)
+
+func (fs *filesystem) newCwdSymlink(task *kernel.Task, ino uint64) kernfs.Inode {
+	inode := &cwdSymlink{task: task}
+	inode.Init(task, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
+	return inode
+}
+
+// Readlink implements kernfs.Inode.Readlink.
+func (s *cwdSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error) {
+	cwd, _, err := s.Getlink(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer cwd.DecRef(ctx)
+
+	root := vfs.RootFromContext(ctx)
+	if !root.Ok() {
+		// It could have raced with process deletion.
+		return "", syserror.ESRCH
+	}
+	defer root.DecRef(ctx)
+
+	vfsObj := cwd.Mount().Filesystem().VirtualFilesystem()
+	name, _ := vfsObj.PathnameWithDeleted(ctx, root, cwd)
+	return name, nil
+}
+
+// Getlink implements kernfs.Inode.Getlink.
+func (s *cwdSymlink) Getlink(ctx context.Context, _ *vfs.Mount) (vfs.VirtualDentry, string, error) {
+	if !kernel.ContextCanTrace(ctx, s.task, false) {
+		return vfs.VirtualDentry{}, "", syserror.EACCES
+	}
+	if err := checkTaskState(s.task); err != nil {
+		return vfs.VirtualDentry{}, "", err
+	}
+	cwd := s.task.FSContext().WorkingDirectoryVFS2()
+	if !cwd.Ok() {
+		// It could have raced with process deletion.
+		return vfs.VirtualDentry{}, "", syserror.ESRCH
+	}
+	return cwd, "", nil
 }
 
 // mountInfoData is used to implement /proc/[pid]/mountinfo.
@@ -784,13 +992,14 @@ func (i *mountsData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	return nil
 }
 
+// +stateify savable
 type namespaceSymlink struct {
 	kernfs.StaticSymlink
 
 	task *kernel.Task
 }
 
-func (fs *filesystem) newNamespaceSymlink(task *kernel.Task, ino uint64, ns string) *kernfs.Dentry {
+func (fs *filesystem) newNamespaceSymlink(task *kernel.Task, ino uint64, ns string) kernfs.Inode {
 	// Namespace symlinks should contain the namespace name and the inode number
 	// for the namespace instance, so for example user:[123456]. We currently fake
 	// the inode number by sticking the symlink inode in its place.
@@ -798,40 +1007,44 @@ func (fs *filesystem) newNamespaceSymlink(task *kernel.Task, ino uint64, ns stri
 
 	inode := &namespaceSymlink{task: task}
 	// Note: credentials are overridden by taskOwnedInode.
-	inode.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, target)
+	inode.Init(task, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, target)
 
 	taskInode := &taskOwnedInode{Inode: inode, owner: task}
-	d := &kernfs.Dentry{}
-	d.Init(taskInode)
-	return d
+	return taskInode
 }
 
-// Readlink implements Inode.
-func (s *namespaceSymlink) Readlink(ctx context.Context) (string, error) {
+// Readlink implements kernfs.Inode.Readlink.
+func (s *namespaceSymlink) Readlink(ctx context.Context, mnt *vfs.Mount) (string, error) {
 	if err := checkTaskState(s.task); err != nil {
 		return "", err
 	}
-	return s.StaticSymlink.Readlink(ctx)
+	return s.StaticSymlink.Readlink(ctx, mnt)
 }
 
-// Getlink implements Inode.Getlink.
+// Getlink implements kernfs.Inode.Getlink.
 func (s *namespaceSymlink) Getlink(ctx context.Context, mnt *vfs.Mount) (vfs.VirtualDentry, string, error) {
 	if err := checkTaskState(s.task); err != nil {
 		return vfs.VirtualDentry{}, "", err
 	}
 
 	// Create a synthetic inode to represent the namespace.
+	fs := mnt.Filesystem().Impl().(*filesystem)
+	nsInode := &namespaceInode{}
+	nsInode.Init(ctx, auth.CredentialsFromContext(ctx), linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), 0444)
 	dentry := &kernfs.Dentry{}
-	dentry.Init(&namespaceInode{})
+	dentry.Init(&fs.Filesystem, nsInode)
 	vd := vfs.MakeVirtualDentry(mnt, dentry.VFSDentry())
-	vd.IncRef()
-	dentry.DecRef(ctx)
+	// Only IncRef vd.Mount() because vd.Dentry() already holds a ref of 1.
+	mnt.IncRef()
 	return vd, "", nil
 }
 
 // namespaceInode is a synthetic inode created to represent a namespace in
 // /proc/[pid]/ns/*.
+//
+// +stateify savable
 type namespaceInode struct {
+	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
 	kernfs.InodeNotDirectory
@@ -843,19 +1056,19 @@ type namespaceInode struct {
 var _ kernfs.Inode = (*namespaceInode)(nil)
 
 // Init initializes a namespace inode.
-func (i *namespaceInode) Init(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode) {
+func (i *namespaceInode) Init(ctx context.Context, creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode) {
 	if perm&^linux.PermissionsMask != 0 {
 		panic(fmt.Sprintf("Only permission mask must be set: %x", perm&linux.PermissionsMask))
 	}
-	i.InodeAttrs.Init(creds, devMajor, devMinor, ino, linux.ModeRegular|perm)
+	i.InodeAttrs.Init(ctx, creds, devMajor, devMinor, ino, linux.ModeRegular|perm)
 }
 
-// Open implements Inode.Open.
-func (i *namespaceInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+// Open implements kernfs.Inode.Open.
+func (i *namespaceInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	fd := &namespaceFD{inode: i}
 	i.IncRef()
 	fd.LockFD.Init(&i.locks)
-	if err := fd.vfsfd.Init(fd, opts.Flags, rp.Mount(), vfsd, &vfs.FileDescriptionOptions{}); err != nil {
+	if err := fd.vfsfd.Init(fd, opts.Flags, rp.Mount(), d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
 		return nil, err
 	}
 	return &fd.vfsfd, nil
@@ -863,6 +1076,8 @@ func (i *namespaceInode) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *
 
 // namespace FD is a synthetic file that represents a namespace in
 // /proc/[pid]/ns/*.
+//
+// +stateify savable
 type namespaceFD struct {
 	vfs.FileDescriptionDefaultImpl
 	vfs.LockFD
@@ -873,20 +1088,20 @@ type namespaceFD struct {
 
 var _ vfs.FileDescriptionImpl = (*namespaceFD)(nil)
 
-// Stat implements FileDescriptionImpl.
+// Stat implements vfs.FileDescriptionImpl.Stat.
 func (fd *namespaceFD) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, error) {
 	vfs := fd.vfsfd.VirtualDentry().Mount().Filesystem()
 	return fd.inode.Stat(ctx, vfs, opts)
 }
 
-// SetStat implements FileDescriptionImpl.
+// SetStat implements vfs.FileDescriptionImpl.SetStat.
 func (fd *namespaceFD) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
 	vfs := fd.vfsfd.VirtualDentry().Mount().Filesystem()
 	creds := auth.CredentialsFromContext(ctx)
 	return fd.inode.SetStat(ctx, vfs, creds, opts)
 }
 
-// Release implements FileDescriptionImpl.
+// Release implements vfs.FileDescriptionImpl.Release.
 func (fd *namespaceFD) Release(ctx context.Context) {
 	fd.inode.DecRef(ctx)
 }

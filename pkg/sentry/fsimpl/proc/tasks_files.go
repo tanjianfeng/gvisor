@@ -31,7 +31,9 @@ import (
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
+// +stateify savable
 type selfSymlink struct {
+	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
 	kernfs.InodeSymlink
@@ -41,16 +43,13 @@ type selfSymlink struct {
 
 var _ kernfs.Inode = (*selfSymlink)(nil)
 
-func (fs *filesystem) newSelfSymlink(creds *auth.Credentials, ino uint64, pidns *kernel.PIDNamespace) *kernfs.Dentry {
-	inode := &selfSymlink{pidns: pidns}
-	inode.Init(creds, linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
-
-	d := &kernfs.Dentry{}
-	d.Init(inode)
-	return d
+func (i *tasksInode) newSelfSymlink(ctx context.Context, creds *auth.Credentials) kernfs.Inode {
+	inode := &selfSymlink{pidns: i.pidns}
+	inode.Init(ctx, creds, linux.UNNAMED_MAJOR, i.fs.devMinor, i.fs.NextIno(), linux.ModeSymlink|0777)
+	return inode
 }
 
-func (s *selfSymlink) Readlink(ctx context.Context) (string, error) {
+func (s *selfSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error) {
 	t := kernel.TaskFromContext(ctx)
 	if t == nil {
 		// Who is reading this link?
@@ -63,17 +62,19 @@ func (s *selfSymlink) Readlink(ctx context.Context) (string, error) {
 	return strconv.FormatUint(uint64(tgid), 10), nil
 }
 
-func (s *selfSymlink) Getlink(ctx context.Context, _ *vfs.Mount) (vfs.VirtualDentry, string, error) {
-	target, err := s.Readlink(ctx)
+func (s *selfSymlink) Getlink(ctx context.Context, mnt *vfs.Mount) (vfs.VirtualDentry, string, error) {
+	target, err := s.Readlink(ctx, mnt)
 	return vfs.VirtualDentry{}, target, err
 }
 
-// SetStat implements Inode.SetStat not allowing inode attributes to be changed.
+// SetStat implements kernfs.Inode.SetStat not allowing inode attributes to be changed.
 func (*selfSymlink) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, vfs.SetStatOptions) error {
 	return syserror.EPERM
 }
 
+// +stateify savable
 type threadSelfSymlink struct {
+	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
 	kernfs.InodeSymlink
@@ -83,16 +84,13 @@ type threadSelfSymlink struct {
 
 var _ kernfs.Inode = (*threadSelfSymlink)(nil)
 
-func (fs *filesystem) newThreadSelfSymlink(creds *auth.Credentials, ino uint64, pidns *kernel.PIDNamespace) *kernfs.Dentry {
-	inode := &threadSelfSymlink{pidns: pidns}
-	inode.Init(creds, linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
-
-	d := &kernfs.Dentry{}
-	d.Init(inode)
-	return d
+func (i *tasksInode) newThreadSelfSymlink(ctx context.Context, creds *auth.Credentials) kernfs.Inode {
+	inode := &threadSelfSymlink{pidns: i.pidns}
+	inode.Init(ctx, creds, linux.UNNAMED_MAJOR, i.fs.devMinor, i.fs.NextIno(), linux.ModeSymlink|0777)
+	return inode
 }
 
-func (s *threadSelfSymlink) Readlink(ctx context.Context) (string, error) {
+func (s *threadSelfSymlink) Readlink(ctx context.Context, _ *vfs.Mount) (string, error) {
 	t := kernel.TaskFromContext(ctx)
 	if t == nil {
 		// Who is reading this link?
@@ -106,12 +104,12 @@ func (s *threadSelfSymlink) Readlink(ctx context.Context) (string, error) {
 	return fmt.Sprintf("%d/task/%d", tgid, tid), nil
 }
 
-func (s *threadSelfSymlink) Getlink(ctx context.Context, _ *vfs.Mount) (vfs.VirtualDentry, string, error) {
-	target, err := s.Readlink(ctx)
+func (s *threadSelfSymlink) Getlink(ctx context.Context, mnt *vfs.Mount) (vfs.VirtualDentry, string, error) {
+	target, err := s.Readlink(ctx, mnt)
 	return vfs.VirtualDentry{}, target, err
 }
 
-// SetStat implements Inode.SetStat not allowing inode attributes to be changed.
+// SetStat implements kernfs.Inode.SetStat not allowing inode attributes to be changed.
 func (*threadSelfSymlink) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, vfs.SetStatOptions) error {
 	return syserror.EPERM
 }
@@ -119,16 +117,20 @@ func (*threadSelfSymlink) SetStat(context.Context, *vfs.Filesystem, *auth.Creden
 // dynamicBytesFileSetAttr implements a special file that allows inode
 // attributes to be set. This is to support /proc files that are readonly, but
 // allow attributes to be set.
+//
+// +stateify savable
 type dynamicBytesFileSetAttr struct {
 	kernfs.DynamicBytesFile
 }
 
-// SetStat implements Inode.SetStat.
+// SetStat implements kernfs.Inode.SetStat.
 func (d *dynamicBytesFileSetAttr) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Credentials, opts vfs.SetStatOptions) error {
 	return d.DynamicBytesFile.InodeAttrs.SetStat(ctx, fs, creds, opts)
 }
 
 // cpuStats contains the breakdown of CPU time for /proc/stat.
+//
+// +stateify savable
 type cpuStats struct {
 	// user is time spent in userspace tasks with non-positive niceness.
 	user uint64

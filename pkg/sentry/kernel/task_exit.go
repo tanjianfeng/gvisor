@@ -239,6 +239,8 @@ func (*runExitMain) execute(t *Task) taskRunState {
 	t.traceExitEvent()
 	lastExiter := t.exitThreadGroup()
 
+	t.ResetKcov()
+
 	// If the task has a cleartid, and the thread group wasn't killed by a
 	// signal, handle that before releasing the MM.
 	if t.cleartid != 0 {
@@ -246,7 +248,8 @@ func (*runExitMain) execute(t *Task) taskRunState {
 		signaled := t.tg.exiting && t.tg.exitStatus.Signaled()
 		t.tg.signalHandlers.mu.Unlock()
 		if !signaled {
-			if _, err := t.CopyOut(t.cleartid, ThreadID(0)); err == nil {
+			zero := ThreadID(0)
+			if _, err := zero.CopyOut(t, t.cleartid); err == nil {
 				t.Futex().Wake(t, t.cleartid, false, ^uint32(0), 1)
 			}
 			// If the CopyOut fails, there's nothing we can do.
@@ -277,12 +280,13 @@ func (*runExitMain) execute(t *Task) taskRunState {
 		t.mountNamespaceVFS2.DecRef(t)
 		t.mountNamespaceVFS2 = nil
 	}
+	t.ipcns.DecRef(t)
 	t.mu.Unlock()
 
 	// If this is the last task to exit from the thread group, release the
 	// thread group's resources.
 	if lastExiter {
-		t.tg.release(t)
+		t.tg.Release(t)
 	}
 
 	// Detach tracees.

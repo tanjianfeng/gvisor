@@ -100,62 +100,107 @@ func (s *Stack) InterfaceAddrs() map[int32][]inet.InterfaceAddr {
 	return nicAddrs
 }
 
-// AddInterfaceAddr implements inet.Stack.AddInterfaceAddr.
-func (s *Stack) AddInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
+// convertAddr converts an InterfaceAddr to a ProtocolAddress.
+func convertAddr(addr inet.InterfaceAddr) (tcpip.ProtocolAddress, error) {
 	var (
-		protocol tcpip.NetworkProtocolNumber
-		address  tcpip.Address
+		protocol        tcpip.NetworkProtocolNumber
+		address         tcpip.Address
+		protocolAddress tcpip.ProtocolAddress
 	)
 	switch addr.Family {
 	case linux.AF_INET:
-		if len(addr.Addr) < header.IPv4AddressSize {
-			return syserror.EINVAL
+		if len(addr.Addr) != header.IPv4AddressSize {
+			return protocolAddress, syserror.EINVAL
 		}
 		if addr.PrefixLen > header.IPv4AddressSize*8 {
-			return syserror.EINVAL
+			return protocolAddress, syserror.EINVAL
 		}
 		protocol = ipv4.ProtocolNumber
-		address = tcpip.Address(addr.Addr[:header.IPv4AddressSize])
-
+		address = tcpip.Address(addr.Addr)
 	case linux.AF_INET6:
-		if len(addr.Addr) < header.IPv6AddressSize {
-			return syserror.EINVAL
+		if len(addr.Addr) != header.IPv6AddressSize {
+			return protocolAddress, syserror.EINVAL
 		}
 		if addr.PrefixLen > header.IPv6AddressSize*8 {
-			return syserror.EINVAL
+			return protocolAddress, syserror.EINVAL
 		}
 		protocol = ipv6.ProtocolNumber
-		address = tcpip.Address(addr.Addr[:header.IPv6AddressSize])
-
+		address = tcpip.Address(addr.Addr)
 	default:
-		return syserror.ENOTSUP
+		return protocolAddress, syserror.ENOTSUP
 	}
 
-	protocolAddress := tcpip.ProtocolAddress{
+	protocolAddress = tcpip.ProtocolAddress{
 		Protocol: protocol,
 		AddressWithPrefix: tcpip.AddressWithPrefix{
 			Address:   address,
 			PrefixLen: int(addr.PrefixLen),
 		},
 	}
+	return protocolAddress, nil
+}
+
+// AddInterfaceAddr implements inet.Stack.AddInterfaceAddr.
+func (s *Stack) AddInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
+	protocolAddress, err := convertAddr(addr)
+	if err != nil {
+		return err
+	}
 
 	// Attach address to interface.
-	if err := s.Stack.AddProtocolAddressWithOptions(tcpip.NICID(idx), protocolAddress, stack.CanBePrimaryEndpoint); err != nil {
+	nicID := tcpip.NICID(idx)
+	if err := s.Stack.AddProtocolAddressWithOptions(nicID, protocolAddress, stack.CanBePrimaryEndpoint); err != nil {
 		return syserr.TranslateNetstackError(err).ToError()
 	}
 
-	// Add route for local network.
-	s.Stack.AddRoute(tcpip.Route{
+	// Add route for local network if it doesn't exist already.
+	localRoute := tcpip.Route{
 		Destination: protocolAddress.AddressWithPrefix.Subnet(),
 		Gateway:     "", // No gateway for local network.
-		NIC:         tcpip.NICID(idx),
+		NIC:         nicID,
+	}
+
+	for _, rt := range s.Stack.GetRouteTable() {
+		if rt.Equal(localRoute) {
+			return nil
+		}
+	}
+
+	// Local route does not exist yet. Add it.
+	s.Stack.AddRoute(localRoute)
+
+	return nil
+}
+
+// RemoveInterfaceAddr implements inet.Stack.RemoveInterfaceAddr.
+func (s *Stack) RemoveInterfaceAddr(idx int32, addr inet.InterfaceAddr) error {
+	protocolAddress, err := convertAddr(addr)
+	if err != nil {
+		return err
+	}
+
+	// Remove addresses matching the address and prefix.
+	nicID := tcpip.NICID(idx)
+	if err := s.Stack.RemoveAddress(nicID, protocolAddress.AddressWithPrefix.Address); err != nil {
+		return syserr.TranslateNetstackError(err).ToError()
+	}
+
+	// Remove the corresponding local network route if it exists.
+	localRoute := tcpip.Route{
+		Destination: protocolAddress.AddressWithPrefix.Subnet(),
+		Gateway:     "", // No gateway for local network.
+		NIC:         nicID,
+	}
+	s.Stack.RemoveRoutes(func(rt tcpip.Route) bool {
+		return rt.Equal(localRoute)
 	})
+
 	return nil
 }
 
 // TCPReceiveBufferSize implements inet.Stack.TCPReceiveBufferSize.
 func (s *Stack) TCPReceiveBufferSize() (inet.TCPBufferSize, error) {
-	var rs tcp.ReceiveBufferSizeOption
+	var rs tcpip.TCPReceiveBufferSizeRangeOption
 	err := s.Stack.TransportProtocolOption(tcp.ProtocolNumber, &rs)
 	return inet.TCPBufferSize{
 		Min:     rs.Min,
@@ -166,17 +211,17 @@ func (s *Stack) TCPReceiveBufferSize() (inet.TCPBufferSize, error) {
 
 // SetTCPReceiveBufferSize implements inet.Stack.SetTCPReceiveBufferSize.
 func (s *Stack) SetTCPReceiveBufferSize(size inet.TCPBufferSize) error {
-	rs := tcp.ReceiveBufferSizeOption{
+	rs := tcpip.TCPReceiveBufferSizeRangeOption{
 		Min:     size.Min,
 		Default: size.Default,
 		Max:     size.Max,
 	}
-	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, rs)).ToError()
+	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, &rs)).ToError()
 }
 
 // TCPSendBufferSize implements inet.Stack.TCPSendBufferSize.
 func (s *Stack) TCPSendBufferSize() (inet.TCPBufferSize, error) {
-	var ss tcp.SendBufferSizeOption
+	var ss tcpip.TCPSendBufferSizeRangeOption
 	err := s.Stack.TransportProtocolOption(tcp.ProtocolNumber, &ss)
 	return inet.TCPBufferSize{
 		Min:     ss.Min,
@@ -187,29 +232,30 @@ func (s *Stack) TCPSendBufferSize() (inet.TCPBufferSize, error) {
 
 // SetTCPSendBufferSize implements inet.Stack.SetTCPSendBufferSize.
 func (s *Stack) SetTCPSendBufferSize(size inet.TCPBufferSize) error {
-	ss := tcp.SendBufferSizeOption{
+	ss := tcpip.TCPSendBufferSizeRangeOption{
 		Min:     size.Min,
 		Default: size.Default,
 		Max:     size.Max,
 	}
-	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, ss)).ToError()
+	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, &ss)).ToError()
 }
 
 // TCPSACKEnabled implements inet.Stack.TCPSACKEnabled.
 func (s *Stack) TCPSACKEnabled() (bool, error) {
-	var sack tcp.SACKEnabled
+	var sack tcpip.TCPSACKEnabled
 	err := s.Stack.TransportProtocolOption(tcp.ProtocolNumber, &sack)
 	return bool(sack), syserr.TranslateNetstackError(err).ToError()
 }
 
 // SetTCPSACKEnabled implements inet.Stack.SetTCPSACKEnabled.
 func (s *Stack) SetTCPSACKEnabled(enabled bool) error {
-	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.SACKEnabled(enabled))).ToError()
+	opt := tcpip.TCPSACKEnabled(enabled)
+	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)).ToError()
 }
 
 // TCPRecovery implements inet.Stack.TCPRecovery.
 func (s *Stack) TCPRecovery() (inet.TCPLossRecovery, error) {
-	var recovery tcp.Recovery
+	var recovery tcpip.TCPRecovery
 	if err := s.Stack.TransportProtocolOption(tcp.ProtocolNumber, &recovery); err != nil {
 		return 0, syserr.TranslateNetstackError(err).ToError()
 	}
@@ -218,7 +264,8 @@ func (s *Stack) TCPRecovery() (inet.TCPLossRecovery, error) {
 
 // SetTCPRecovery implements inet.Stack.SetTCPRecovery.
 func (s *Stack) SetTCPRecovery(recovery inet.TCPLossRecovery) error {
-	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, tcp.Recovery(recovery))).ToError()
+	opt := tcpip.TCPRecovery(recovery)
+	return syserr.TranslateNetstackError(s.Stack.SetTransportProtocolOption(tcp.ProtocolNumber, &opt)).ToError()
 }
 
 // Statistics implements inet.Stack.Statistics.
@@ -409,4 +456,25 @@ func (s *Stack) CleanupEndpoints() []stack.TransportEndpoint {
 // RestoreCleanupEndpoints implements inet.Stack.RestoreCleanupEndpoints.
 func (s *Stack) RestoreCleanupEndpoints(es []stack.TransportEndpoint) {
 	s.Stack.RestoreCleanupEndpoints(es)
+}
+
+// Forwarding implements inet.Stack.Forwarding.
+func (s *Stack) Forwarding(protocol tcpip.NetworkProtocolNumber) bool {
+	switch protocol {
+	case ipv4.ProtocolNumber, ipv6.ProtocolNumber:
+		return s.Stack.Forwarding(protocol)
+	default:
+		panic(fmt.Sprintf("Forwarding(%v) failed: unsupported protocol", protocol))
+	}
+}
+
+// SetForwarding implements inet.Stack.SetForwarding.
+func (s *Stack) SetForwarding(protocol tcpip.NetworkProtocolNumber, enable bool) error {
+	switch protocol {
+	case ipv4.ProtocolNumber, ipv6.ProtocolNumber:
+		s.Stack.SetForwarding(protocol, enable)
+	default:
+		panic(fmt.Sprintf("SetForwarding(%v) failed: unsupported protocol", protocol))
+	}
+	return nil
 }

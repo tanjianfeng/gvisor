@@ -16,6 +16,8 @@
 package tundev
 
 import (
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
@@ -26,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/tcpip/link/tun"
+	"gvisor.dev/gvisor/pkg/tcpip/network/arp"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
@@ -36,6 +39,8 @@ const (
 )
 
 // tunDevice implements vfs.Device for /dev/net/tun.
+//
+// +stateify savable
 type tunDevice struct{}
 
 // Open implements vfs.Device.Open.
@@ -50,6 +55,8 @@ func (tunDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, opt
 }
 
 // tunFD implements vfs.FileDescriptionImpl for /dev/net/tun.
+//
+// +stateify savable
 type tunFD struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -64,12 +71,13 @@ func (fd *tunFD) Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArg
 	request := args[1].Uint()
 	data := args[2].Pointer()
 
+	t := kernel.TaskFromContext(ctx)
+	if t == nil {
+		panic("Ioctl should be called from a task context")
+	}
+
 	switch request {
 	case linux.TUNSETIFF:
-		t := kernel.TaskFromContext(ctx)
-		if t == nil {
-			panic("Ioctl should be called from a task context")
-		}
 		if !t.HasCapability(linux.CAP_NET_ADMIN) {
 			return 0, syserror.EPERM
 		}
@@ -79,13 +87,20 @@ func (fd *tunFD) Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArg
 		}
 
 		var req linux.IFReq
-		if _, err := usermem.CopyObjectIn(ctx, uio, data, &req, usermem.IOOpts{
-			AddressSpaceActive: true,
-		}); err != nil {
+		if _, err := req.CopyIn(t, data); err != nil {
 			return 0, err
 		}
 		flags := usermem.ByteOrder.Uint16(req.Data[:])
-		return 0, fd.device.SetIff(stack.Stack, req.Name(), flags)
+		created, err := fd.device.SetIff(stack.Stack, req.Name(), flags)
+		if err == nil && created {
+			// Always start with an ARP address for interfaces so they can handle ARP
+			// packets.
+			nicID := fd.device.NICID()
+			if err := stack.Stack.AddAddress(nicID, arp.ProtocolNumber, arp.ProtocolAddress); err != nil {
+				panic(fmt.Sprintf("failed to add ARP address after creating new TUN/TAP interface with ID = %d", nicID))
+			}
+		}
+		return 0, err
 
 	case linux.TUNGETIFF:
 		var req linux.IFReq
@@ -97,9 +112,7 @@ func (fd *tunFD) Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArg
 		flags := fd.device.Flags() | linux.IFF_NOFILTER
 		usermem.ByteOrder.PutUint16(req.Data[:], flags)
 
-		_, err := usermem.CopyObjectOut(ctx, uio, data, &req, usermem.IOOpts{
-			AddressSpaceActive: true,
-		})
+		_, err := req.CopyOut(t, data)
 		return 0, err
 
 	default:

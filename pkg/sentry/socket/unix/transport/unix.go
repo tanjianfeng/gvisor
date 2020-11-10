@@ -32,6 +32,8 @@ import (
 const initialLimit = 16 * 1024
 
 // A RightsControlMessage is a control message containing FDs.
+//
+// +stateify savable
 type RightsControlMessage interface {
 	// Clone returns a copy of the RightsControlMessage.
 	Clone() RightsControlMessage
@@ -151,7 +153,10 @@ type Endpoint interface {
 	// block if no new connections are available.
 	//
 	// The returned Queue is the wait queue for the newly created endpoint.
-	Accept() (Endpoint, *syserr.Error)
+	//
+	// peerAddr if not nil will be populated with the address of the connected
+	// peer on a successful accept.
+	Accept(peerAddr *tcpip.FullAddress) (Endpoint, *syserr.Error)
 
 	// Bind binds the endpoint to a specific local address and port.
 	// Specifying a NIC is optional.
@@ -172,9 +177,8 @@ type Endpoint interface {
 	// connected.
 	GetRemoteAddress() (tcpip.FullAddress, *tcpip.Error)
 
-	// SetSockOpt sets a socket option. opt should be one of the tcpip.*Option
-	// types.
-	SetSockOpt(opt interface{}) *tcpip.Error
+	// SetSockOpt sets a socket option.
+	SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error
 
 	// SetSockOptBool sets a socket option for simple cases when a value has
 	// the int type.
@@ -184,9 +188,8 @@ type Endpoint interface {
 	// the int type.
 	SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error
 
-	// GetSockOpt gets a socket option. opt should be a pointer to one of the
-	// tcpip.*Option types.
-	GetSockOpt(opt interface{}) *tcpip.Error
+	// GetSockOpt gets a socket option.
+	GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error
 
 	// GetSockOptBool gets a socket option for simple cases when a return
 	// value has the int type.
@@ -199,6 +202,9 @@ type Endpoint interface {
 	// State returns the current state of the socket, as represented by Linux in
 	// procfs.
 	State() uint32
+
+	// LastError implements tcpip.Endpoint.LastError.
+	LastError() *tcpip.Error
 }
 
 // A Credentialer is a socket or endpoint that supports the SO_PASSCRED socket
@@ -332,7 +338,7 @@ type Receiver interface {
 	RecvMaxQueueSize() int64
 
 	// Release releases any resources owned by the Receiver. It should be
-	// called before droping all references to a Receiver.
+	// called before dropping all references to a Receiver.
 	Release(ctx context.Context)
 }
 
@@ -483,7 +489,7 @@ func (q *streamQueueReceiver) Recv(ctx context.Context, data [][]byte, wantCreds
 		c := q.control.Clone()
 
 		// Don't consume data since we are peeking.
-		copied, data, _ = vecCopy(data, q.buffer)
+		copied, _, _ = vecCopy(data, q.buffer)
 
 		return copied, copied, c, false, q.addr, notify, nil
 	}
@@ -568,6 +574,12 @@ func (q *streamQueueReceiver) Recv(ctx context.Context, data [][]byte, wantCreds
 	return copied, copied, c, cmTruncated, q.addr, notify, nil
 }
 
+// Release implements Receiver.Release.
+func (q *streamQueueReceiver) Release(ctx context.Context) {
+	q.queueReceiver.Release(ctx)
+	q.control.Release(ctx)
+}
+
 // A ConnectedEndpoint is an Endpoint that can be used to send Messages.
 type ConnectedEndpoint interface {
 	// Passcred implements Endpoint.Passcred.
@@ -615,7 +627,7 @@ type ConnectedEndpoint interface {
 	SendMaxQueueSize() int64
 
 	// Release releases any resources owned by the ConnectedEndpoint. It should
-	// be called before droping all references to a ConnectedEndpoint.
+	// be called before dropping all references to a ConnectedEndpoint.
 	Release(ctx context.Context)
 
 	// CloseUnread sets the fact that this end is closed with unread data to
@@ -742,6 +754,9 @@ type baseEndpoint struct {
 	// path is not empty if the endpoint has been bound,
 	// or may be used if the endpoint is connected.
 	path string
+
+	// linger is used for SO_LINGER socket option.
+	linger tcpip.LingerOption
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
@@ -837,8 +852,14 @@ func (e *baseEndpoint) SendMsg(ctx context.Context, data [][]byte, c ControlMess
 	return n, err
 }
 
-// SetSockOpt sets a socket option. Currently not supported.
-func (e *baseEndpoint) SetSockOpt(opt interface{}) *tcpip.Error {
+// SetSockOpt sets a socket option.
+func (e *baseEndpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
+	switch v := opt.(type) {
+	case *tcpip.LingerOption:
+		e.Lock()
+		e.linger = *v
+		e.Unlock()
+	}
 	return nil
 }
 
@@ -866,7 +887,7 @@ func (e *baseEndpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 
 func (e *baseEndpoint) GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error) {
 	switch opt {
-	case tcpip.KeepaliveEnabledOption:
+	case tcpip.KeepaliveEnabledOption, tcpip.AcceptConnOption:
 		return false, nil
 
 	case tcpip.PasscredOption:
@@ -940,15 +961,23 @@ func (e *baseEndpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error) {
 }
 
 // GetSockOpt implements tcpip.Endpoint.GetSockOpt.
-func (e *baseEndpoint) GetSockOpt(opt interface{}) *tcpip.Error {
-	switch opt.(type) {
-	case tcpip.ErrorOption:
+func (e *baseEndpoint) GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error {
+	switch o := opt.(type) {
+	case *tcpip.LingerOption:
+		e.Lock()
+		*o = e.linger
+		e.Unlock()
 		return nil
 
 	default:
 		log.Warningf("Unsupported socket option: %T", opt)
 		return tcpip.ErrUnknownProtocolOption
 	}
+}
+
+// LastError implements Endpoint.LastError.
+func (*baseEndpoint) LastError() *tcpip.Error {
+	return nil
 }
 
 // Shutdown closes the read and/or write end of the endpoint connection to its

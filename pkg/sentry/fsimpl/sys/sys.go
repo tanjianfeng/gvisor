@@ -18,9 +18,11 @@ package sys
 import (
 	"bytes"
 	"fmt"
+	"strconv"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/coverage"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -28,14 +30,21 @@ import (
 	"gvisor.dev/gvisor/pkg/syserror"
 )
 
-// Name is the default filesystem name.
-const Name = "sysfs"
-const defaultSysDirMode = linux.FileMode(0755)
+const (
+	// Name is the default filesystem name.
+	Name                     = "sysfs"
+	defaultSysDirMode        = linux.FileMode(0755)
+	defaultMaxCachedDentries = uint64(1000)
+)
 
 // FilesystemType implements vfs.FilesystemType.
+//
+// +stateify savable
 type FilesystemType struct{}
 
 // filesystem implements vfs.FilesystemImpl.
+//
+// +stateify savable
 type filesystem struct {
 	kernfs.Filesystem
 
@@ -47,6 +56,9 @@ func (FilesystemType) Name() string {
 	return Name
 }
 
+// Release implements vfs.FilesystemType.Release.
+func (FilesystemType) Release(ctx context.Context) {}
+
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
 	devMinor, err := vfsObj.GetAnonBlockDevMinor()
@@ -54,44 +66,73 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, err
 	}
 
+	mopts := vfs.GenericParseMountOptions(opts.Data)
+	maxCachedDentries := defaultMaxCachedDentries
+	if str, ok := mopts["dentry_cache_limit"]; ok {
+		delete(mopts, "dentry_cache_limit")
+		maxCachedDentries, err = strconv.ParseUint(str, 10, 64)
+		if err != nil {
+			ctx.Warningf("sys.FilesystemType.GetFilesystem: invalid dentry cache limit: dentry_cache_limit=%s", str)
+			return nil, nil, syserror.EINVAL
+		}
+	}
+
 	fs := &filesystem{
 		devMinor: devMinor,
 	}
+	fs.MaxCachedDentries = maxCachedDentries
 	fs.VFSFilesystem().Init(vfsObj, &fsType, fs)
 
-	root := fs.newDir(creds, defaultSysDirMode, map[string]*kernfs.Dentry{
-		"block": fs.newDir(creds, defaultSysDirMode, nil),
-		"bus":   fs.newDir(creds, defaultSysDirMode, nil),
-		"class": fs.newDir(creds, defaultSysDirMode, map[string]*kernfs.Dentry{
-			"power_supply": fs.newDir(creds, defaultSysDirMode, nil),
+	root := fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+		"block": fs.newDir(ctx, creds, defaultSysDirMode, nil),
+		"bus":   fs.newDir(ctx, creds, defaultSysDirMode, nil),
+		"class": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+			"power_supply": fs.newDir(ctx, creds, defaultSysDirMode, nil),
 		}),
-		"dev": fs.newDir(creds, defaultSysDirMode, nil),
-		"devices": fs.newDir(creds, defaultSysDirMode, map[string]*kernfs.Dentry{
-			"system": fs.newDir(creds, defaultSysDirMode, map[string]*kernfs.Dentry{
+		"dev": fs.newDir(ctx, creds, defaultSysDirMode, nil),
+		"devices": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+			"system": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 				"cpu": cpuDir(ctx, fs, creds),
 			}),
 		}),
-		"firmware": fs.newDir(creds, defaultSysDirMode, nil),
-		"fs":       fs.newDir(creds, defaultSysDirMode, nil),
-		"kernel":   fs.newDir(creds, defaultSysDirMode, nil),
-		"module":   fs.newDir(creds, defaultSysDirMode, nil),
-		"power":    fs.newDir(creds, defaultSysDirMode, nil),
+		"firmware": fs.newDir(ctx, creds, defaultSysDirMode, nil),
+		"fs":       fs.newDir(ctx, creds, defaultSysDirMode, nil),
+		"kernel":   kernelDir(ctx, fs, creds),
+		"module":   fs.newDir(ctx, creds, defaultSysDirMode, nil),
+		"power":    fs.newDir(ctx, creds, defaultSysDirMode, nil),
 	})
-	return fs.VFSFilesystem(), root.VFSDentry(), nil
+	var rootD kernfs.Dentry
+	rootD.InitRoot(&fs.Filesystem, root)
+	return fs.VFSFilesystem(), rootD.VFSDentry(), nil
 }
 
-func cpuDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) *kernfs.Dentry {
+func cpuDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) kernfs.Inode {
 	k := kernel.KernelFromContext(ctx)
 	maxCPUCores := k.ApplicationCores()
-	children := map[string]*kernfs.Dentry{
-		"online":   fs.newCPUFile(creds, maxCPUCores, linux.FileMode(0444)),
-		"possible": fs.newCPUFile(creds, maxCPUCores, linux.FileMode(0444)),
-		"present":  fs.newCPUFile(creds, maxCPUCores, linux.FileMode(0444)),
+	children := map[string]kernfs.Inode{
+		"online":   fs.newCPUFile(ctx, creds, maxCPUCores, linux.FileMode(0444)),
+		"possible": fs.newCPUFile(ctx, creds, maxCPUCores, linux.FileMode(0444)),
+		"present":  fs.newCPUFile(ctx, creds, maxCPUCores, linux.FileMode(0444)),
 	}
 	for i := uint(0); i < maxCPUCores; i++ {
-		children[fmt.Sprintf("cpu%d", i)] = fs.newDir(creds, linux.FileMode(0555), nil)
+		children[fmt.Sprintf("cpu%d", i)] = fs.newDir(ctx, creds, linux.FileMode(0555), nil)
 	}
-	return fs.newDir(creds, defaultSysDirMode, children)
+	return fs.newDir(ctx, creds, defaultSysDirMode, children)
+}
+
+func kernelDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) kernfs.Inode {
+	// If kcov is available, set up /sys/kernel/debug/kcov. Technically, debugfs
+	// should be mounted at debug/, but for our purposes, it is sufficient to
+	// keep it in sys.
+	var children map[string]kernfs.Inode
+	if coverage.KcovAvailable() {
+		children = map[string]kernfs.Inode{
+			"debug": fs.newDir(ctx, creds, linux.FileMode(0700), map[string]kernfs.Inode{
+				"kcov": fs.newKcovFile(ctx, creds),
+			}),
+		}
+	}
+	return fs.newDir(ctx, creds, defaultSysDirMode, children)
 }
 
 // Release implements vfs.FilesystemImpl.Release.
@@ -101,37 +142,37 @@ func (fs *filesystem) Release(ctx context.Context) {
 }
 
 // dir implements kernfs.Inode.
+//
+// +stateify savable
 type dir struct {
+	dirRefs
+	kernfs.InodeAlwaysValid
 	kernfs.InodeAttrs
-	kernfs.InodeNoDynamicLookup
 	kernfs.InodeNotSymlink
 	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeTemporary
 	kernfs.OrderedChildren
 
 	locks vfs.FileLocks
-
-	dentry kernfs.Dentry
 }
 
-func (fs *filesystem) newDir(creds *auth.Credentials, mode linux.FileMode, contents map[string]*kernfs.Dentry) *kernfs.Dentry {
+func (fs *filesystem) newDir(ctx context.Context, creds *auth.Credentials, mode linux.FileMode, contents map[string]kernfs.Inode) kernfs.Inode {
 	d := &dir{}
-	d.InodeAttrs.Init(creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0755)
+	d.InodeAttrs.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0755)
 	d.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
-	d.dentry.Init(d)
-
-	d.IncLinks(d.OrderedChildren.Populate(&d.dentry, contents))
-
-	return &d.dentry
+	d.EnableLeakCheck()
+	d.IncLinks(d.OrderedChildren.Populate(contents))
+	return d
 }
 
-// SetStat implements Inode.SetStat not allowing inode attributes to be changed.
+// SetStat implements kernfs.Inode.SetStat not allowing inode attributes to be changed.
 func (*dir) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, vfs.SetStatOptions) error {
 	return syserror.EPERM
 }
 
 // Open implements kernfs.Inode.Open.
-func (d *dir) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), vfsd, &d.OrderedChildren, &d.locks, &opts, kernfs.GenericDirectoryFDOptions{
+func (d *dir) Open(ctx context.Context, rp *vfs.ResolvingPath, kd *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), kd, &d.OrderedChildren, &d.locks, &opts, kernfs.GenericDirectoryFDOptions{
 		SeekEnd: kernfs.SeekEndStaticEntries,
 	})
 	if err != nil {
@@ -140,9 +181,23 @@ func (d *dir) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry,
 	return fd.VFSFileDescription(), nil
 }
 
+// DecRef implements kernfs.Inode.DecRef.
+func (d *dir) DecRef(ctx context.Context) {
+	d.dirRefs.DecRef(func() { d.Destroy(ctx) })
+}
+
+// StatFS implements kernfs.Inode.StatFS.
+func (d *dir) StatFS(ctx context.Context, fs *vfs.Filesystem) (linux.Statfs, error) {
+	return vfs.GenericStatFS(linux.SYSFS_MAGIC), nil
+}
+
 // cpuFile implements kernfs.Inode.
+//
+// +stateify savable
 type cpuFile struct {
+	implStatFS
 	kernfs.DynamicBytesFile
+
 	maxCores uint
 }
 
@@ -152,10 +207,16 @@ func (c *cpuFile) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	return nil
 }
 
-func (fs *filesystem) newCPUFile(creds *auth.Credentials, maxCores uint, mode linux.FileMode) *kernfs.Dentry {
+func (fs *filesystem) newCPUFile(ctx context.Context, creds *auth.Credentials, maxCores uint, mode linux.FileMode) kernfs.Inode {
 	c := &cpuFile{maxCores: maxCores}
-	c.DynamicBytesFile.Init(creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), c, mode)
-	d := &kernfs.Dentry{}
-	d.Init(c)
-	return d
+	c.DynamicBytesFile.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), c, mode)
+	return c
+}
+
+// +stateify savable
+type implStatFS struct{}
+
+// StatFS implements kernfs.Inode.StatFS.
+func (*implStatFS) StatFS(context.Context, *vfs.Filesystem) (linux.Statfs, error) {
+	return vfs.GenericStatFS(linux.SYSFS_MAGIC), nil
 }

@@ -139,7 +139,7 @@ type endpoint struct {
 
 	// multicastMemberships that need to be remvoed when the endpoint is
 	// closed. Protected by the mu mutex.
-	multicastMemberships []multicastMembership
+	multicastMemberships map[multicastMembership]struct{}
 
 	// effectiveNetProtos contains the network protocols actually in use. In
 	// most cases it will only contain "netProto", but in cases like IPv6
@@ -154,6 +154,9 @@ type endpoint struct {
 
 	// owner is used to get uid and gid of the packet.
 	owner tcpip.PacketOwner
+
+	// linger is used for SO_LINGER socket option.
+	linger tcpip.LingerOption
 }
 
 // +stateify savable
@@ -182,12 +185,13 @@ func newEndpoint(s *stack.Stack, netProto tcpip.NetworkProtocolNumber, waiterQue
 		// TTL=1.
 		//
 		// Linux defaults to TTL=1.
-		multicastTTL:  1,
-		multicastLoop: true,
-		rcvBufSizeMax: 32 * 1024,
-		sndBufSizeMax: 32 * 1024,
-		state:         StateInitial,
-		uniqueID:      s.UniqueID(),
+		multicastTTL:         1,
+		multicastLoop:        true,
+		rcvBufSizeMax:        32 * 1024,
+		sndBufSizeMax:        32 * 1024,
+		multicastMemberships: make(map[multicastMembership]struct{}),
+		state:                StateInitial,
+		uniqueID:             s.UniqueID(),
 	}
 
 	// Override with stack defaults.
@@ -209,7 +213,7 @@ func (e *endpoint) UniqueID() uint64 {
 	return e.uniqueID
 }
 
-func (e *endpoint) takeLastError() *tcpip.Error {
+func (e *endpoint) LastError() *tcpip.Error {
 	e.lastErrorMu.Lock()
 	defer e.lastErrorMu.Unlock()
 
@@ -237,10 +241,10 @@ func (e *endpoint) Close() {
 		e.boundPortFlags = ports.Flags{}
 	}
 
-	for _, mem := range e.multicastMemberships {
+	for mem := range e.multicastMemberships {
 		e.stack.LeaveGroup(e.NetProto, mem.nicID, mem.multicastAddr)
 	}
-	e.multicastMemberships = nil
+	e.multicastMemberships = make(map[multicastMembership]struct{})
 
 	// Close the receive list and drain it.
 	e.rcvMu.Lock()
@@ -268,7 +272,7 @@ func (e *endpoint) ModerateRecvBuf(copied int) {}
 // Read reads data from the endpoint. This method does not block if
 // there is no data pending.
 func (e *endpoint) Read(addr *tcpip.FullAddress) (buffer.View, tcpip.ControlMessages, *tcpip.Error) {
-	if err := e.takeLastError(); err != nil {
+	if err := e.LastError(); err != nil {
 		return buffer.View{}, tcpip.ControlMessages{}, err
 	}
 
@@ -411,7 +415,7 @@ func (e *endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-c
 }
 
 func (e *endpoint) write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, <-chan struct{}, *tcpip.Error) {
-	if err := e.takeLastError(); err != nil {
+	if err := e.LastError(); err != nil {
 		return 0, nil, err
 	}
 
@@ -683,9 +687,9 @@ func (e *endpoint) SetSockOptInt(opt tcpip.SockOptInt, v int) *tcpip.Error {
 }
 
 // SetSockOpt implements tcpip.Endpoint.SetSockOpt.
-func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
+func (e *endpoint) SetSockOpt(opt tcpip.SettableSocketOption) *tcpip.Error {
 	switch v := opt.(type) {
-	case tcpip.MulticastInterfaceOption:
+	case *tcpip.MulticastInterfaceOption:
 		e.mu.Lock()
 		defer e.mu.Unlock()
 
@@ -721,7 +725,7 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 		e.multicastNICID = nic
 		e.multicastAddr = addr
 
-	case tcpip.AddMembershipOption:
+	case *tcpip.AddMembershipOption:
 		if !header.IsV4MulticastAddress(v.MulticastAddr) && !header.IsV6MulticastAddress(v.MulticastAddr) {
 			return tcpip.ErrInvalidOptionValue
 		}
@@ -752,19 +756,17 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 		e.mu.Lock()
 		defer e.mu.Unlock()
 
-		for _, mem := range e.multicastMemberships {
-			if mem == memToInsert {
-				return tcpip.ErrPortInUse
-			}
+		if _, ok := e.multicastMemberships[memToInsert]; ok {
+			return tcpip.ErrPortInUse
 		}
 
 		if err := e.stack.JoinGroup(e.NetProto, nicID, v.MulticastAddr); err != nil {
 			return err
 		}
 
-		e.multicastMemberships = append(e.multicastMemberships, memToInsert)
+		e.multicastMemberships[memToInsert] = struct{}{}
 
-	case tcpip.RemoveMembershipOption:
+	case *tcpip.RemoveMembershipOption:
 		if !header.IsV4MulticastAddress(v.MulticastAddr) && !header.IsV6MulticastAddress(v.MulticastAddr) {
 			return tcpip.ErrInvalidOptionValue
 		}
@@ -786,18 +788,11 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 		}
 
 		memToRemove := multicastMembership{nicID: nicID, multicastAddr: v.MulticastAddr}
-		memToRemoveIndex := -1
 
 		e.mu.Lock()
 		defer e.mu.Unlock()
 
-		for i, mem := range e.multicastMemberships {
-			if mem == memToRemove {
-				memToRemoveIndex = i
-				break
-			}
-		}
-		if memToRemoveIndex == -1 {
+		if _, ok := e.multicastMemberships[memToRemove]; !ok {
 			return tcpip.ErrBadLocalAddress
 		}
 
@@ -805,11 +800,10 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 			return err
 		}
 
-		e.multicastMemberships[memToRemoveIndex] = e.multicastMemberships[len(e.multicastMemberships)-1]
-		e.multicastMemberships = e.multicastMemberships[:len(e.multicastMemberships)-1]
+		delete(e.multicastMemberships, memToRemove)
 
-	case tcpip.BindToDeviceOption:
-		id := tcpip.NICID(v)
+	case *tcpip.BindToDeviceOption:
+		id := tcpip.NICID(*v)
 		if id != 0 && !e.stack.HasNIC(id) {
 			return tcpip.ErrUnknownDevice
 		}
@@ -817,8 +811,13 @@ func (e *endpoint) SetSockOpt(opt interface{}) *tcpip.Error {
 		e.bindToDevice = id
 		e.mu.Unlock()
 
-	case tcpip.SocketDetachFilterOption:
+	case *tcpip.SocketDetachFilterOption:
 		return nil
+
+	case *tcpip.LingerOption:
+		e.mu.Lock()
+		e.linger = *v
+		e.mu.Unlock()
 	}
 	return nil
 }
@@ -896,6 +895,9 @@ func (e *endpoint) GetSockOptBool(opt tcpip.SockOptBool) (bool, *tcpip.Error) {
 
 		return v, nil
 
+	case tcpip.AcceptConnOption:
+		return false, nil
+
 	default:
 		return false, tcpip.ErrUnknownProtocolOption
 	}
@@ -960,10 +962,8 @@ func (e *endpoint) GetSockOptInt(opt tcpip.SockOptInt) (int, *tcpip.Error) {
 }
 
 // GetSockOpt implements tcpip.Endpoint.GetSockOpt.
-func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
+func (e *endpoint) GetSockOpt(opt tcpip.GettableSocketOption) *tcpip.Error {
 	switch o := opt.(type) {
-	case tcpip.ErrorOption:
-		return e.takeLastError()
 	case *tcpip.MulticastInterfaceOption:
 		e.mu.Lock()
 		*o = tcpip.MulticastInterfaceOption{
@@ -975,6 +975,11 @@ func (e *endpoint) GetSockOpt(opt interface{}) *tcpip.Error {
 	case *tcpip.BindToDeviceOption:
 		e.mu.RLock()
 		*o = tcpip.BindToDeviceOption(e.bindToDevice)
+		e.mu.RUnlock()
+
+	case *tcpip.LingerOption:
+		e.mu.RLock()
+		*o = e.linger
 		e.mu.RUnlock()
 
 	default:
@@ -994,6 +999,7 @@ func sendUDP(r *stack.Route, data buffer.VectorisedView, localPort, remotePort u
 
 	// Initialize the UDP header.
 	udp := header.UDP(pkt.TransportHeader().Push(header.UDPMinimumSize))
+	pkt.TransportProtocolNumber = ProtocolNumber
 
 	length := uint16(pkt.Size())
 	udp.Encode(&header.UDPFields{
@@ -1220,7 +1226,7 @@ func (*endpoint) Listen(int) *tcpip.Error {
 }
 
 // Accept is not supported by UDP, it just fails.
-func (*endpoint) Accept() (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
+func (*endpoint) Accept(*tcpip.FullAddress) (tcpip.Endpoint, *waiter.Queue, *tcpip.Error) {
 	return nil, nil, tcpip.ErrNotSupported
 }
 
@@ -1363,7 +1369,29 @@ func (e *endpoint) Readiness(mask waiter.EventMask) waiter.EventMask {
 		e.rcvMu.Unlock()
 	}
 
+	e.lastErrorMu.Lock()
+	hasError := e.lastError != nil
+	e.lastErrorMu.Unlock()
+	if hasError {
+		result |= waiter.EventErr
+	}
 	return result
+}
+
+// verifyChecksum verifies the checksum unless RX checksum offload is enabled.
+// On IPv4, UDP checksum is optional, and a zero value means the transmitter
+// omitted the checksum generation (RFC768).
+// On IPv6, UDP checksum is not optional (RFC2460 Section 8.1).
+func verifyChecksum(r *stack.Route, hdr header.UDP, pkt *stack.PacketBuffer) bool {
+	if r.Capabilities()&stack.CapabilityRXChecksumOffload == 0 &&
+		(hdr.Checksum() != 0 || r.NetProto == header.IPv6ProtocolNumber) {
+		xsum := r.PseudoHeaderChecksum(ProtocolNumber, hdr.Length())
+		for _, v := range pkt.Data.Views() {
+			xsum = header.Checksum(v, xsum)
+		}
+		return hdr.CalculateChecksum(xsum) == 0xffff
+	}
+	return true
 }
 
 // HandlePacket is called by the stack when new packets arrive to this transport
@@ -1378,31 +1406,11 @@ func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pk
 		return
 	}
 
-	// Never receive from a multicast address.
-	if header.IsV4MulticastAddress(id.RemoteAddress) ||
-		header.IsV6MulticastAddress(id.RemoteAddress) {
-		e.stack.Stats().UDP.InvalidSourceAddress.Increment()
-		e.stack.Stats().IP.InvalidSourceAddressesReceived.Increment()
-		e.stats.ReceiveErrors.MalformedPacketsReceived.Increment()
+	if !verifyChecksum(r, hdr, pkt) {
+		// Checksum Error.
+		e.stack.Stats().UDP.ChecksumErrors.Increment()
+		e.stats.ReceiveErrors.ChecksumErrors.Increment()
 		return
-	}
-
-	// Verify checksum unless RX checksum offload is enabled.
-	// On IPv4, UDP checksum is optional, and a zero value means
-	// the transmitter omitted the checksum generation (RFC768).
-	// On IPv6, UDP checksum is not optional (RFC2460 Section 8.1).
-	if r.Capabilities()&stack.CapabilityRXChecksumOffload == 0 &&
-		(hdr.Checksum() != 0 || r.NetProto == header.IPv6ProtocolNumber) {
-		xsum := r.PseudoHeaderChecksum(ProtocolNumber, hdr.Length())
-		for _, v := range pkt.Data.Views() {
-			xsum = header.Checksum(v, xsum)
-		}
-		if hdr.CalculateChecksum(xsum) != 0xffff {
-			// Checksum Error.
-			e.stack.Stats().UDP.ChecksumErrors.Increment()
-			e.stats.ReceiveErrors.ChecksumErrors.Increment()
-			return
-		}
 	}
 
 	e.stack.Stats().UDP.PacketsReceived.Increment()
@@ -1466,14 +1474,16 @@ func (e *endpoint) HandlePacket(r *stack.Route, id stack.TransportEndpointID, pk
 func (e *endpoint) HandleControlPacket(id stack.TransportEndpointID, typ stack.ControlType, extra uint32, pkt *stack.PacketBuffer) {
 	if typ == stack.ControlPortUnreachable {
 		e.mu.RLock()
-		defer e.mu.RUnlock()
-
 		if e.state == StateConnected {
 			e.lastErrorMu.Lock()
-			defer e.lastErrorMu.Unlock()
-
 			e.lastError = tcpip.ErrConnectionRefused
+			e.lastErrorMu.Unlock()
+			e.mu.RUnlock()
+
+			e.waiterQueue.Notify(waiter.EventErr)
+			return
 		}
+		e.mu.RUnlock()
 	}
 }
 

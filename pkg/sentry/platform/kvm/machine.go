@@ -25,6 +25,7 @@ import (
 	"gvisor.dev/gvisor/pkg/procid"
 	"gvisor.dev/gvisor/pkg/sentry/platform/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/platform/ring0/pagetables"
+	ktime "gvisor.dev/gvisor/pkg/sentry/time"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -43,9 +44,6 @@ type machine struct {
 	// kernel is the set of global structures.
 	kernel ring0.Kernel
 
-	// mappingCache is used for mapPhysical.
-	mappingCache sync.Map
-
 	// mu protects vCPUs.
 	mu sync.RWMutex
 
@@ -62,6 +60,12 @@ type machine struct {
 
 	// maxVCPUs is the maximum number of vCPUs supported by the machine.
 	maxVCPUs int
+
+	// maxSlots is the maximum number of memory slots supported by the machine.
+	maxSlots int
+
+	// usedSlots is the set of used physical addresses (sorted).
+	usedSlots []uintptr
 
 	// nextID is the next vCPU ID.
 	nextID uint32
@@ -100,8 +104,11 @@ type vCPU struct {
 	// tid is the last set tid.
 	tid uint64
 
-	// switches is a count of world switches (informational only).
-	switches uint32
+	// userExits is the count of user exits.
+	userExits uint64
+
+	// guestExits is the count of guest to host world switches.
+	guestExits uint64
 
 	// faults is a count of world faults (informational only).
 	faults uint32
@@ -124,6 +131,7 @@ type vCPU struct {
 	// vCPUArchState is the architecture-specific state.
 	vCPUArchState
 
+	// dieState holds state related to vCPU death.
 	dieState dieState
 }
 
@@ -152,7 +160,7 @@ func (m *machine) newVCPU() *vCPU {
 		fd:      int(fd),
 		machine: m,
 	}
-	c.CPU.Init(&m.kernel, c)
+	c.CPU.Init(&m.kernel, c.id, c)
 	m.vCPUsByID[c.id] = c
 
 	// Ensure the signal mask is correct.
@@ -180,10 +188,8 @@ func newMachine(vm int) (*machine, error) {
 	// Create the machine.
 	m := &machine{fd: vm}
 	m.available.L = &m.mu
-	m.kernel.Init(ring0.KernelOpts{
-		PageTables: pagetables.New(newAllocator()),
-	})
 
+	// Pull the maximum vCPUs.
 	maxVCPUs, _, errno := syscall.RawSyscall(syscall.SYS_IOCTL, uintptr(m.fd), _KVM_CHECK_EXTENSION, _KVM_CAP_MAX_VCPUS)
 	if errno != 0 {
 		m.maxVCPUs = _KVM_NR_VCPUS
@@ -191,10 +197,21 @@ func newMachine(vm int) (*machine, error) {
 		m.maxVCPUs = int(maxVCPUs)
 	}
 	log.Debugf("The maximum number of vCPUs is %d.", m.maxVCPUs)
-
-	// Create the vCPUs map/slices.
 	m.vCPUsByTID = make(map[uint64]*vCPU)
 	m.vCPUsByID = make([]*vCPU, m.maxVCPUs)
+	m.kernel.Init(ring0.KernelOpts{
+		PageTables: pagetables.New(newAllocator()),
+	}, m.maxVCPUs)
+
+	// Pull the maximum slots.
+	maxSlots, _, errno := syscall.RawSyscall(syscall.SYS_IOCTL, uintptr(m.fd), _KVM_CHECK_EXTENSION, _KVM_CAP_MAX_MEMSLOTS)
+	if errno != 0 {
+		m.maxSlots = _KVM_NR_MEMSLOTS
+	} else {
+		m.maxSlots = int(maxSlots)
+	}
+	log.Debugf("The maximum number of slots is %d.", m.maxSlots)
+	m.usedSlots = make([]uintptr, m.maxSlots)
 
 	// Apply the physical mappings. Note that these mappings may point to
 	// guest physical addresses that are not actually available. These
@@ -207,15 +224,9 @@ func newMachine(vm int) (*machine, error) {
 			pagetables.MapOpts{AccessType: usermem.AnyAccess},
 			pr.physical)
 
-		// And keep everything in the upper half.
-		m.kernel.PageTables.Map(
-			usermem.Addr(ring0.KernelStartAddress|pr.virtual),
-			pr.length,
-			pagetables.MapOpts{AccessType: usermem.AnyAccess},
-			pr.physical)
-
 		return true // Keep iterating.
 	})
+	m.mapUpperHalf(m.kernel.PageTables)
 
 	var physicalRegionsReadOnly []physicalRegion
 	var physicalRegionsAvailable []physicalRegion
@@ -272,6 +283,20 @@ func newMachine(vm int) (*machine, error) {
 	return m, nil
 }
 
+// hasSlot returns true iff the given address is mapped.
+//
+// This must be done via a linear scan.
+//
+//go:nosplit
+func (m *machine) hasSlot(physical uintptr) bool {
+	for i := 0; i < len(m.usedSlots); i++ {
+		if p := atomic.LoadUintptr(&m.usedSlots[i]); p == physical {
+			return true
+		}
+	}
+	return false
+}
+
 // mapPhysical checks for the mapping of a physical range, and installs one if
 // not available. This attempts to be efficient for calls in the hot path.
 //
@@ -286,8 +311,8 @@ func (m *machine) mapPhysical(physical, length uintptr, phyRegions []physicalReg
 			panic("mapPhysical on unknown physical address")
 		}
 
-		if _, ok := m.mappingCache.LoadOrStore(physicalStart, true); !ok {
-			// Not present in the cache; requires setting the slot.
+		// Is this already mapped? Check the usedSlots.
+		if !m.hasSlot(physicalStart) {
 			if _, ok := handleBluepillFault(m, physical, phyRegions, flags); !ok {
 				panic("handleBluepillFault failed")
 			}
@@ -339,6 +364,11 @@ func (m *machine) Destroy() {
 // Get gets an available vCPU.
 //
 // This will return with the OS thread locked.
+//
+// It is guaranteed that if any OS thread TID is in guest, m.vCPUs[TID] points
+// to the vCPU in which the OS thread TID is running. So if Get() returns with
+// the corrent context in guest, the vCPU of it must be the same as what
+// Get() returns.
 func (m *machine) Get() *vCPU {
 	m.mu.RLock()
 	runtime.LockOSThread()
@@ -443,6 +473,19 @@ func (m *machine) newDirtySet() *dirtySet {
 	}
 }
 
+// dropPageTables drops cached page table entries.
+func (m *machine) dropPageTables(pt *pagetables.PageTables) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Clear from all PCIDs.
+	for _, c := range m.vCPUsByID {
+		if c != nil && c.PCIDs != nil {
+			c.PCIDs.Drop(pt)
+		}
+	}
+}
+
 // lock marks the vCPU as in user mode.
 //
 // This should only be called directly when known to be safe, i.e. when
@@ -502,6 +545,8 @@ var pid = syscall.Getpid()
 //
 // This effectively unwinds the state machine.
 func (c *vCPU) bounce(forceGuestExit bool) {
+	origGuestExits := atomic.LoadUint64(&c.guestExits)
+	origUserExits := atomic.LoadUint64(&c.userExits)
 	for {
 		switch state := atomic.LoadUint32(&c.state); state {
 		case vCPUReady, vCPUWaiter:
@@ -557,6 +602,14 @@ func (c *vCPU) bounce(forceGuestExit bool) {
 			// Should not happen: the above is exhaustive.
 			panic("invalid state")
 		}
+
+		// Check if we've missed the state transition, but
+		// we can safely return at this point in time.
+		newGuestExits := atomic.LoadUint64(&c.guestExits)
+		newUserExits := atomic.LoadUint64(&c.userExits)
+		if newUserExits != origUserExits && (!forceGuestExit || newGuestExits != origGuestExits) {
+			return
+		}
 	}
 }
 
@@ -572,4 +625,36 @@ func (c *vCPU) BounceToKernel() {
 //go:nosplit
 func (c *vCPU) BounceToHost() {
 	c.bounce(true)
+}
+
+// setSystemTimeLegacy calibrates and sets an approximate system time.
+func (c *vCPU) setSystemTimeLegacy() error {
+	const minIterations = 10
+	minimum := uint64(0)
+	for iter := 0; ; iter++ {
+		// Try to set the TSC to an estimate of where it will be
+		// on the host during a "fast" system call iteration.
+		start := uint64(ktime.Rdtsc())
+		if err := c.setTSC(start + (minimum / 2)); err != nil {
+			return err
+		}
+		// See if this is our new minimum call time. Note that this
+		// serves two functions: one, we make sure that we are
+		// accurately predicting the offset we need to set. Second, we
+		// don't want to do the final set on a slow call, which could
+		// produce a really bad result.
+		end := uint64(ktime.Rdtsc())
+		if end < start {
+			continue // Totally bogus: unstable TSC?
+		}
+		current := end - start
+		if current < minimum || iter == 0 {
+			minimum = current // Set our new minimum.
+		}
+		// Is this past minIterations and within ~10% of minimum?
+		upperThreshold := (((minimum << 3) + minimum) >> 3)
+		if iter >= minIterations && current <= upperThreshold {
+			return nil
+		}
+	}
 }

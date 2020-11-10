@@ -36,12 +36,11 @@ func (d *dentry) isSocket() bool {
 // An endpoint's lifetime is the time between when filesystem.BoundEndpointAt()
 // is called and either BoundEndpoint.BidirectionalConnect or
 // BoundEndpoint.UnidirectionalConnect is called.
+//
+// +stateify savable
 type endpoint struct {
 	// dentry is the filesystem dentry which produced this endpoint.
 	dentry *dentry
-
-	// file is the p9 file that contains a single unopened fid.
-	file p9.File
 
 	// path is the sentry path where this endpoint is bound.
 	path string
@@ -114,7 +113,7 @@ func (e *endpoint) UnidirectionalConnect(ctx context.Context) (transport.Connect
 }
 
 func (e *endpoint) newConnectedEndpoint(ctx context.Context, flags p9.ConnectFlags, queue *waiter.Queue) (*host.SCMConnectedEndpoint, *syserr.Error) {
-	hostFile, err := e.file.Connect(flags)
+	hostFile, err := e.dentry.file.connect(ctx, flags)
 	if err != nil {
 		return nil, syserr.ErrConnectionRefused
 	}
@@ -129,7 +128,7 @@ func (e *endpoint) newConnectedEndpoint(ctx context.Context, flags p9.ConnectFla
 
 	c, serr := host.NewSCMEndpoint(ctx, hostFD, queue, e.path)
 	if serr != nil {
-		log.Warningf("Gofer returned invalid host socket for BidirectionalConnect; file %+v flags %+v: %v", e.file, flags, serr)
+		log.Warningf("Gofer returned invalid host socket for BidirectionalConnect; file %+v flags %+v: %v", e.dentry.file, flags, serr)
 		return nil, serr
 	}
 	return c, nil

@@ -22,6 +22,7 @@ import (
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/control/server"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
@@ -29,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/state"
 	"gvisor.dev/gvisor/pkg/sentry/time"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/urpc"
@@ -257,13 +259,20 @@ func (cm *containerManager) Start(args *StartArgs, _ *struct{}) error {
 	// All validation passed, logs the spec for debugging.
 	specutils.LogSpec(args.Spec)
 
-	err := cm.l.startContainer(args.Spec, args.Conf, args.CID, args.FilePayload.Files)
+	fds, err := fd.NewFromFiles(args.FilePayload.Files)
 	if err != nil {
+		return err
+	}
+	defer func() {
+		for _, fd := range fds {
+			_ = fd.Close()
+		}
+	}()
+	if err := cm.l.startContainer(args.Spec, args.Conf, args.CID, fds); err != nil {
 		log.Debugf("containerManager.Start failed %q: %+v: %v", args.CID, args, err)
 		return err
 	}
 	log.Debugf("Container %q started", args.CID)
-
 	return nil
 }
 
@@ -359,12 +368,20 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
 	cm.l.k = k
 
 	// Set up the restore environment.
+	ctx := k.SupervisorContext()
 	mntr := newContainerMounter(cm.l.root.spec, cm.l.root.goferFDs, cm.l.k, cm.l.mountHints)
-	renv, err := mntr.createRestoreEnvironment(cm.l.root.conf)
-	if err != nil {
-		return fmt.Errorf("creating RestoreEnvironment: %v", err)
+	if kernel.VFS2Enabled {
+		ctx, err = mntr.configureRestore(ctx, cm.l.root.conf)
+		if err != nil {
+			return fmt.Errorf("configuring filesystem restore: %v", err)
+		}
+	} else {
+		renv, err := mntr.createRestoreEnvironment(cm.l.root.conf)
+		if err != nil {
+			return fmt.Errorf("creating RestoreEnvironment: %v", err)
+		}
+		fs.SetRestoreEnvironment(*renv)
 	}
-	fs.SetRestoreEnvironment(*renv)
 
 	// Prepare to load from the state file.
 	if eps, ok := networkStack.(*netstack.Stack); ok {
@@ -391,7 +408,7 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) error {
 
 	// Load the state.
 	loadOpts := state.LoadOpts{Source: specFile}
-	if err := loadOpts.Load(k, networkStack, time.NewCalibratedClocks()); err != nil {
+	if err := loadOpts.Load(ctx, k, networkStack, time.NewCalibratedClocks(), &vfs.CompleteRestoreOptions{}); err != nil {
 		return err
 	}
 

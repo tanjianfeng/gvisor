@@ -14,7 +14,13 @@
 
 package inet
 
-import "gvisor.dev/gvisor/pkg/tcpip/stack"
+import (
+	"bytes"
+	"fmt"
+
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+)
 
 // TestStack is a dummy implementation of Stack for tests.
 type TestStack struct {
@@ -26,6 +32,7 @@ type TestStack struct {
 	TCPSendBufSize    TCPBufferSize
 	TCPSACKFlag       bool
 	Recovery          TCPLossRecovery
+	IPForwarding      bool
 }
 
 // NewTestStack returns a TestStack with no network interfaces. The value of
@@ -51,6 +58,24 @@ func (s *TestStack) InterfaceAddrs() map[int32][]InterfaceAddr {
 // AddInterfaceAddr implements Stack.AddInterfaceAddr.
 func (s *TestStack) AddInterfaceAddr(idx int32, addr InterfaceAddr) error {
 	s.InterfaceAddrsMap[idx] = append(s.InterfaceAddrsMap[idx], addr)
+	return nil
+}
+
+// RemoveInterfaceAddr implements Stack.RemoveInterfaceAddr.
+func (s *TestStack) RemoveInterfaceAddr(idx int32, addr InterfaceAddr) error {
+	interfaceAddrs, ok := s.InterfaceAddrsMap[idx]
+	if !ok {
+		return fmt.Errorf("unknown idx: %d", idx)
+	}
+
+	var filteredAddrs []InterfaceAddr
+	for _, interfaceAddr := range interfaceAddrs {
+		if !bytes.Equal(interfaceAddr.Addr, addr.Addr) {
+			filteredAddrs = append(filteredAddrs, addr)
+		}
+	}
+	s.InterfaceAddrsMap[idx] = filteredAddrs
+
 	return nil
 }
 
@@ -128,3 +153,14 @@ func (s *TestStack) CleanupEndpoints() []stack.TransportEndpoint {
 
 // RestoreCleanupEndpoints implements inet.Stack.RestoreCleanupEndpoints.
 func (s *TestStack) RestoreCleanupEndpoints([]stack.TransportEndpoint) {}
+
+// Forwarding implements inet.Stack.Forwarding.
+func (s *TestStack) Forwarding(protocol tcpip.NetworkProtocolNumber) bool {
+	return s.IPForwarding
+}
+
+// SetForwarding implements inet.Stack.SetForwarding.
+func (s *TestStack) SetForwarding(protocol tcpip.NetworkProtocolNumber, enable bool) error {
+	s.IPForwarding = enable
+	return nil
+}

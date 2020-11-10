@@ -18,9 +18,9 @@ import (
 	"container/heap"
 	"fmt"
 	"math"
-	"time"
 
 	"gvisor.dev/gvisor/pkg/sync"
+	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 )
 
@@ -40,15 +40,16 @@ type reassembler struct {
 	deleted      int
 	heap         fragHeap
 	done         bool
-	creationTime time.Time
+	creationTime int64
+	callback     func(bool)
 }
 
-func newReassembler(id FragmentID) *reassembler {
+func newReassembler(id FragmentID, clock tcpip.Clock) *reassembler {
 	r := &reassembler{
 		id:           id,
 		holes:        make([]hole, 0, 16),
 		heap:         make(fragHeap, 0, 8),
-		creationTime: time.Now(),
+		creationTime: clock.NowMonotonic(),
 	}
 	r.holes = append(r.holes, hole{
 		first:   0,
@@ -116,14 +117,31 @@ func (r *reassembler) process(first, last uint16, more bool, proto uint8, vv buf
 	return res, r.proto, true, consumed, nil
 }
 
-func (r *reassembler) tooOld(timeout time.Duration) bool {
-	return time.Now().Sub(r.creationTime) > timeout
-}
-
 func (r *reassembler) checkDoneOrMark() bool {
 	r.mu.Lock()
 	prev := r.done
 	r.done = true
 	r.mu.Unlock()
 	return prev
+}
+
+func (r *reassembler) setCallback(c func(bool)) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.callback != nil {
+		return false
+	}
+	r.callback = c
+	return true
+}
+
+func (r *reassembler) release(timedOut bool) {
+	r.mu.Lock()
+	callback := r.callback
+	r.callback = nil
+	r.mu.Unlock()
+
+	if callback != nil {
+		callback(timedOut)
+	}
 }

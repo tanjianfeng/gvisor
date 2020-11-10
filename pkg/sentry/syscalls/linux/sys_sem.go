@@ -18,6 +18,7 @@ import (
 	"math"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -66,7 +67,7 @@ func Semop(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	}
 
 	ops := make([]linux.Sembuf, nsops)
-	if _, err := t.CopyIn(sembufAddr, ops); err != nil {
+	if _, err := linux.CopySembufSliceIn(t, sembufAddr, ops); err != nil {
 		return 0, nil, err
 	}
 
@@ -116,8 +117,8 @@ func Semctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 
 	case linux.IPC_SET:
 		arg := args[3].Pointer()
-		s := linux.SemidDS{}
-		if _, err := t.CopyIn(arg, &s); err != nil {
+		var s linux.SemidDS
+		if _, err := s.CopyIn(t, arg); err != nil {
 			return 0, nil, err
 		}
 
@@ -128,9 +129,17 @@ func Semctl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 		v, err := getPID(t, id, num)
 		return uintptr(v), nil, err
 
+	case linux.IPC_STAT:
+		arg := args[3].Pointer()
+		ds, err := ipcStat(t, id)
+		if err == nil {
+			_, err = ds.CopyOut(t, arg)
+		}
+
+		return 0, nil, err
+
 	case linux.IPC_INFO,
 		linux.SEM_INFO,
-		linux.IPC_STAT,
 		linux.SEM_STAT,
 		linux.SEM_STAT_ANY,
 		linux.GETNCNT,
@@ -170,6 +179,16 @@ func ipcSet(t *kernel.Task, id int32, uid auth.UID, gid auth.GID, perms fs.FileP
 	return set.Change(t, creds, owner, perms)
 }
 
+func ipcStat(t *kernel.Task, id int32) (*linux.SemidDS, error) {
+	r := t.IPCNamespace().SemaphoreRegistry()
+	set := r.FindByID(id)
+	if set == nil {
+		return nil, syserror.EINVAL
+	}
+	creds := auth.CredentialsFromContext(t)
+	return set.GetStat(creds)
+}
+
 func setVal(t *kernel.Task, id int32, num int32, val int16) error {
 	r := t.IPCNamespace().SemaphoreRegistry()
 	set := r.FindByID(id)
@@ -188,7 +207,7 @@ func setValAll(t *kernel.Task, id int32, array usermem.Addr) error {
 		return syserror.EINVAL
 	}
 	vals := make([]uint16, set.Size())
-	if _, err := t.CopyIn(array, vals); err != nil {
+	if _, err := primitive.CopyUint16SliceIn(t, array, vals); err != nil {
 		return err
 	}
 	creds := auth.CredentialsFromContext(t)
@@ -217,7 +236,7 @@ func getValAll(t *kernel.Task, id int32, array usermem.Addr) error {
 	if err != nil {
 		return err
 	}
-	_, err = t.CopyOut(array, vals)
+	_, err = primitive.CopyUint16SliceOut(t, array, vals)
 	return err
 }
 

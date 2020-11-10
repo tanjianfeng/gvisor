@@ -17,23 +17,11 @@ package gofer
 import (
 	"sync/atomic"
 
-	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
 func dentryTimestampFromP9(s, ns uint64) int64 {
 	return int64(s*1e9 + ns)
-}
-
-func dentryTimestampFromStatx(ts linux.StatxTimestamp) int64 {
-	return ts.Sec*1e9 + int64(ts.Nsec)
-}
-
-func statxTimestampFromDentry(ns int64) linux.StatxTimestamp {
-	return linux.StatxTimestamp{
-		Sec:  ns / 1e9,
-		Nsec: uint32(ns % 1e9),
-	}
 }
 
 // Preconditions: d.cachedMetadataAuthoritative() == true.
@@ -49,6 +37,20 @@ func (d *dentry) touchAtime(mnt *vfs.Mount) {
 	atomic.StoreInt64(&d.atime, now)
 	atomic.StoreUint32(&d.atimeDirty, 1)
 	d.metadataMu.Unlock()
+	mnt.EndWrite()
+}
+
+// Preconditions: d.metadataMu is locked. d.cachedMetadataAuthoritative() == true.
+func (d *dentry) touchAtimeLocked(mnt *vfs.Mount) {
+	if mnt.Flags.NoATime || mnt.ReadOnly() {
+		return
+	}
+	if err := mnt.CheckBeginWrite(); err != nil {
+		return
+	}
+	now := d.fs.clock.Now().Nanoseconds()
+	atomic.StoreInt64(&d.atime, now)
+	atomic.StoreUint32(&d.atimeDirty, 1)
 	mnt.EndWrite()
 }
 

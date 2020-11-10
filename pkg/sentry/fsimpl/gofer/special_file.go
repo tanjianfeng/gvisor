@@ -15,15 +15,16 @@
 package gofer
 
 import (
-	"sync"
 	"sync/atomic"
 	"syscall"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fdnotifier"
+	"gvisor.dev/gvisor/pkg/p9"
 	"gvisor.dev/gvisor/pkg/safemem"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
@@ -33,11 +34,13 @@ import (
 // special files, and (when filesystemOptions.regularFilesUseSpecialFileFD is
 // in effect) regular files. specialFileFD differs from regularFileFD by using
 // per-FD handles instead of shared per-dentry handles, and never buffering I/O.
+//
+// +stateify savable
 type specialFileFD struct {
 	fileDescription
 
 	// handle is used for file I/O. handle is immutable.
-	handle handle
+	handle handle `state:"nosave"`
 
 	// isRegularFile is true if this FD represents a regular file which is only
 	// possible when filesystemOptions.regularFilesUseSpecialFileFD is in
@@ -51,12 +54,20 @@ type specialFileFD struct {
 
 	// haveQueue is true if this file description represents a file for which
 	// queue may send I/O readiness events. haveQueue is immutable.
-	haveQueue bool
+	haveQueue bool `state:"nosave"`
 	queue     waiter.Queue
 
 	// If seekable is true, off is the file offset. off is protected by mu.
-	mu  sync.Mutex
+	mu  sync.Mutex `state:"nosave"`
 	off int64
+
+	// If haveBuf is non-zero, this FD represents a pipe, and buf contains data
+	// read from the pipe from previous calls to specialFileFD.savePipeData().
+	// haveBuf and buf are protected by bufMu. haveBuf is accessed using atomic
+	// memory operations.
+	bufMu   sync.Mutex `state:"nosave"`
+	haveBuf uint32
+	buf     []byte
 }
 
 func newSpecialFileFD(h handle, mnt *vfs.Mount, d *dentry, locks *vfs.FileLocks, flags uint32) (*specialFileFD, error) {
@@ -84,6 +95,9 @@ func newSpecialFileFD(h handle, mnt *vfs.Mount, d *dentry, locks *vfs.FileLocks,
 		}
 		return nil, err
 	}
+	d.fs.syncMu.Lock()
+	d.fs.specialFileFDs[fd] = struct{}{}
+	d.fs.syncMu.Unlock()
 	return fd, nil
 }
 
@@ -135,6 +149,16 @@ func (fd *specialFileFD) EventUnregister(e *waiter.Entry) {
 	fd.fileDescription.EventUnregister(e)
 }
 
+func (fd *specialFileFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
+	if fd.isRegularFile {
+		d := fd.dentry()
+		return d.doAllocate(ctx, offset, length, func() error {
+			return fd.handle.file.allocate(ctx, p9.ToAllocateMode(mode), offset, length)
+		})
+	}
+	return fd.FileDescriptionDefaultImpl.Allocate(ctx, mode, offset, length)
+}
+
 // PRead implements vfs.FileDescriptionImpl.PRead.
 func (fd *specialFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offset int64, opts vfs.ReadOptions) (int64, error) {
 	if fd.seekable && offset < 0 {
@@ -148,26 +172,51 @@ func (fd *specialFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		return 0, syserror.EOPNOTSUPP
 	}
 
-	// Going through dst.CopyOutFrom() holds MM locks around file operations of
-	// unknown duration. For regularFileFD, doing so is necessary to support
-	// mmap due to lock ordering; MM locks precede dentry.dataMu. That doesn't
-	// hold here since specialFileFD doesn't client-cache data. Just buffer the
-	// read instead.
 	if d := fd.dentry(); d.cachedMetadataAuthoritative() {
 		d.touchAtime(fd.vfsfd.Mount())
 	}
+
+	bufN := int64(0)
+	if atomic.LoadUint32(&fd.haveBuf) != 0 {
+		var err error
+		fd.bufMu.Lock()
+		if len(fd.buf) != 0 {
+			var n int
+			n, err = dst.CopyOut(ctx, fd.buf)
+			dst = dst.DropFirst(n)
+			fd.buf = fd.buf[n:]
+			if len(fd.buf) == 0 {
+				atomic.StoreUint32(&fd.haveBuf, 0)
+				fd.buf = nil
+			}
+			bufN = int64(n)
+			if offset >= 0 {
+				offset += bufN
+			}
+		}
+		fd.bufMu.Unlock()
+		if err != nil {
+			return bufN, err
+		}
+	}
+
+	// Going through dst.CopyOutFrom() would hold MM locks around file
+	// operations of unknown duration. For regularFileFD, doing so is necessary
+	// to support mmap due to lock ordering; MM locks precede dentry.dataMu.
+	// That doesn't hold here since specialFileFD doesn't client-cache data.
+	// Just buffer the read instead.
 	buf := make([]byte, dst.NumBytes())
 	n, err := fd.handle.readToBlocksAt(ctx, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf)), uint64(offset))
 	if err == syserror.EAGAIN {
 		err = syserror.ErrWouldBlock
 	}
 	if n == 0 {
-		return 0, err
+		return bufN, err
 	}
 	if cp, cperr := dst.CopyOut(ctx, buf[:n]); cperr != nil {
-		return int64(cp), cperr
+		return bufN + int64(cp), cperr
 	}
-	return int64(n), err
+	return bufN + int64(n), err
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.
@@ -204,16 +253,16 @@ func (fd *specialFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 	}
 
 	d := fd.dentry()
-	// If the regular file fd was opened with O_APPEND, make sure the file size
-	// is updated. There is a possible race here if size is modified externally
-	// after metadata cache is updated.
-	if fd.isRegularFile && fd.vfsfd.StatusFlags()&linux.O_APPEND != 0 && !d.cachedMetadataAuthoritative() {
-		if err := d.updateFromGetattr(ctx); err != nil {
-			return 0, offset, err
-		}
-	}
-
 	if fd.isRegularFile {
+		// If the regular file fd was opened with O_APPEND, make sure the file
+		// size is updated. There is a possible race here if size is modified
+		// externally after metadata cache is updated.
+		if fd.vfsfd.StatusFlags()&linux.O_APPEND != 0 && !d.cachedMetadataAuthoritative() {
+			if err := d.updateFromGetattr(ctx); err != nil {
+				return 0, offset, err
+			}
+		}
+
 		// We need to hold the metadataMu *while* writing to a regular file.
 		d.metadataMu.Lock()
 		defer d.metadataMu.Unlock()
@@ -235,11 +284,12 @@ func (fd *specialFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		d.touchCMtime()
 	}
 	buf := make([]byte, src.NumBytes())
-	// Don't do partial writes if we get a partial read from src.
-	if _, err := src.CopyIn(ctx, buf); err != nil {
-		return 0, offset, err
+	copied, copyErr := src.CopyIn(ctx, buf)
+	if copied == 0 && copyErr != nil {
+		// Only return the error if we didn't get any data.
+		return 0, offset, copyErr
 	}
-	n, err := fd.handle.writeFromBlocksAt(ctx, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf)), uint64(offset))
+	n, err := fd.handle.writeFromBlocksAt(ctx, safemem.BlockSeqOf(safemem.BlockFromSafeSlice(buf[:copied])), uint64(offset))
 	if err == syserror.EAGAIN {
 		err = syserror.ErrWouldBlock
 	}
@@ -256,7 +306,10 @@ func (fd *specialFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 			atomic.StoreUint64(&d.size, uint64(offset))
 		}
 	}
-	return int64(n), offset, err
+	if err != nil {
+		return int64(n), offset, err
+	}
+	return int64(n), offset, copyErr
 }
 
 // Write implements vfs.FileDescriptionImpl.Write.
@@ -289,13 +342,31 @@ func (fd *specialFileFD) Seek(ctx context.Context, offset int64, whence int32) (
 
 // Sync implements vfs.FileDescriptionImpl.Sync.
 func (fd *specialFileFD) Sync(ctx context.Context) error {
-	// If we have a host FD, fsyncing it is likely to be faster than an fsync
-	// RPC.
-	if fd.handle.fd >= 0 {
-		ctx.UninterruptibleSleepStart(false)
-		err := syscall.Fsync(int(fd.handle.fd))
-		ctx.UninterruptibleSleepFinish(false)
-		return err
+	return fd.sync(ctx, false /* forFilesystemSync */)
+}
+
+func (fd *specialFileFD) sync(ctx context.Context, forFilesystemSync bool) error {
+	err := func() error {
+		// If we have a host FD, fsyncing it is likely to be faster than an fsync
+		// RPC.
+		if fd.handle.fd >= 0 {
+			ctx.UninterruptibleSleepStart(false)
+			err := syscall.Fsync(int(fd.handle.fd))
+			ctx.UninterruptibleSleepFinish(false)
+			return err
+		}
+		return fd.handle.file.fsync(ctx)
+	}()
+	if err != nil {
+		if !forFilesystemSync {
+			return err
+		}
+		// Only return err if we can reasonably have expected sync to succeed
+		// (fd represents a regular file that was opened for writing).
+		if fd.isRegularFile && fd.vfsfd.IsWritable() {
+			return err
+		}
+		ctx.Debugf("gofer.specialFileFD.sync: syncing non-writable or non-regular-file FD failed: %v", err)
 	}
-	return fd.handle.file.fsync(ctx)
+	return nil
 }

@@ -129,7 +129,7 @@ type NUDDispatcher interface {
 	// the stack's operation.
 	//
 	// May be called concurrently.
-	OnNeighborAdded(nicID tcpip.NICID, ipAddr tcpip.Address, linkAddr tcpip.LinkAddress, state NeighborState, updatedAt time.Time)
+	OnNeighborAdded(tcpip.NICID, NeighborEntry)
 
 	// OnNeighborChanged will be called when an entry in a NIC's (with ID nicID)
 	// neighbor table changes state and/or link address.
@@ -138,7 +138,7 @@ type NUDDispatcher interface {
 	// the stack's operation.
 	//
 	// May be called concurrently.
-	OnNeighborChanged(nicID tcpip.NICID, ipAddr tcpip.Address, linkAddr tcpip.LinkAddress, state NeighborState, updatedAt time.Time)
+	OnNeighborChanged(tcpip.NICID, NeighborEntry)
 
 	// OnNeighborRemoved will be called when an entry is removed from a NIC's
 	// (with ID nicID) neighbor table.
@@ -147,7 +147,7 @@ type NUDDispatcher interface {
 	// the stack's operation.
 	//
 	// May be called concurrently.
-	OnNeighborRemoved(nicID tcpip.NICID, ipAddr tcpip.Address, linkAddr tcpip.LinkAddress, state NeighborState, updatedAt time.Time)
+	OnNeighborRemoved(tcpip.NICID, NeighborEntry)
 }
 
 // ReachabilityConfirmationFlags describes the flags used within a reachability
@@ -177,7 +177,7 @@ type NUDHandler interface {
 	// Neighbor Solicitation for ARP or NDP, respectively). Validation of the
 	// probe needs to be performed before calling this function since the
 	// Neighbor Cache doesn't have access to view the NIC's assigned addresses.
-	HandleProbe(remoteAddr, localAddr tcpip.Address, protocol tcpip.NetworkProtocolNumber, remoteLinkAddr tcpip.LinkAddress, linkRes LinkAddressResolver)
+	HandleProbe(remoteAddr tcpip.Address, protocol tcpip.NetworkProtocolNumber, remoteLinkAddr tcpip.LinkAddress, linkRes LinkAddressResolver)
 
 	// HandleConfirmation processes an incoming neighbor confirmation (e.g. ARP
 	// reply or Neighbor Advertisement for ARP or NDP, respectively).

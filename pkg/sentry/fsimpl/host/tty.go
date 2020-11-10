@@ -17,6 +17,7 @@ package host
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -29,6 +30,8 @@ import (
 
 // TTYFileDescription implements vfs.FileDescriptionImpl for a host file
 // descriptor that wraps a TTY FD.
+//
+// +stateify savable
 type TTYFileDescription struct {
 	fileDescription
 
@@ -75,7 +78,7 @@ func (t *TTYFileDescription) Release(ctx context.Context) {
 	t.fileDescription.Release(ctx)
 }
 
-// PRead implements vfs.FileDescriptionImpl.
+// PRead implements vfs.FileDescriptionImpl.PRead.
 //
 // Reading from a TTY is only allowed for foreground process groups. Background
 // process groups will either get EIO or a SIGTTIN.
@@ -93,7 +96,7 @@ func (t *TTYFileDescription) PRead(ctx context.Context, dst usermem.IOSequence, 
 	return t.fileDescription.PRead(ctx, dst, offset, opts)
 }
 
-// Read implements vfs.FileDescriptionImpl.
+// Read implements vfs.FileDescriptionImpl.Read.
 //
 // Reading from a TTY is only allowed for foreground process groups. Background
 // process groups will either get EIO or a SIGTTIN.
@@ -111,7 +114,7 @@ func (t *TTYFileDescription) Read(ctx context.Context, dst usermem.IOSequence, o
 	return t.fileDescription.Read(ctx, dst, opts)
 }
 
-// PWrite implements vfs.FileDescriptionImpl.
+// PWrite implements vfs.FileDescriptionImpl.PWrite.
 func (t *TTYFileDescription) PWrite(ctx context.Context, src usermem.IOSequence, offset int64, opts vfs.WriteOptions) (int64, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -126,7 +129,7 @@ func (t *TTYFileDescription) PWrite(ctx context.Context, src usermem.IOSequence,
 	return t.fileDescription.PWrite(ctx, src, offset, opts)
 }
 
-// Write implements vfs.FileDescriptionImpl.
+// Write implements vfs.FileDescriptionImpl.Write.
 func (t *TTYFileDescription) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -141,8 +144,13 @@ func (t *TTYFileDescription) Write(ctx context.Context, src usermem.IOSequence, 
 	return t.fileDescription.Write(ctx, src, opts)
 }
 
-// Ioctl implements vfs.FileDescriptionImpl.
+// Ioctl implements vfs.FileDescriptionImpl.Ioctl.
 func (t *TTYFileDescription) Ioctl(ctx context.Context, io usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+	task := kernel.TaskFromContext(ctx)
+	if task == nil {
+		return 0, syserror.ENOTTY
+	}
+
 	// Ignore arg[0]. This is the real FD:
 	fd := t.inode.hostFD
 	ioctl := args[1].Uint64()
@@ -152,9 +160,7 @@ func (t *TTYFileDescription) Ioctl(ctx context.Context, io usermem.IO, args arch
 		if err != nil {
 			return 0, err
 		}
-		_, err = usermem.CopyObjectOut(ctx, io, args[2].Pointer(), termios, usermem.IOOpts{
-			AddressSpaceActive: true,
-		})
+		_, err = termios.CopyOut(task, args[2].Pointer())
 		return 0, err
 
 	case linux.TCSETS, linux.TCSETSW, linux.TCSETSF:
@@ -166,9 +172,7 @@ func (t *TTYFileDescription) Ioctl(ctx context.Context, io usermem.IO, args arch
 		}
 
 		var termios linux.Termios
-		if _, err := usermem.CopyObjectIn(ctx, io, args[2].Pointer(), &termios, usermem.IOOpts{
-			AddressSpaceActive: true,
-		}); err != nil {
+		if _, err := termios.CopyIn(task, args[2].Pointer()); err != nil {
 			return 0, err
 		}
 		err := ioctlSetTermios(fd, ioctl, &termios)
@@ -192,21 +196,14 @@ func (t *TTYFileDescription) Ioctl(ctx context.Context, io usermem.IO, args arch
 		defer t.mu.Unlock()
 
 		// Map the ProcessGroup into a ProcessGroupID in the task's PID namespace.
-		pgID := pidns.IDOfProcessGroup(t.fgProcessGroup)
-		_, err := usermem.CopyObjectOut(ctx, io, args[2].Pointer(), &pgID, usermem.IOOpts{
-			AddressSpaceActive: true,
-		})
+		pgID := primitive.Int32(pidns.IDOfProcessGroup(t.fgProcessGroup))
+		_, err := pgID.CopyOut(task, args[2].Pointer())
 		return 0, err
 
 	case linux.TIOCSPGRP:
 		// Args: const pid_t *argp
 		// Equivalent to tcsetpgrp(fd, *argp).
 		// Set the foreground process group ID of this terminal.
-
-		task := kernel.TaskFromContext(ctx)
-		if task == nil {
-			return 0, syserror.ENOTTY
-		}
 
 		t.mu.Lock()
 		defer t.mu.Unlock()
@@ -226,12 +223,11 @@ func (t *TTYFileDescription) Ioctl(ctx context.Context, io usermem.IO, args arch
 			return 0, syserror.ENOTTY
 		}
 
-		var pgID kernel.ProcessGroupID
-		if _, err := usermem.CopyObjectIn(ctx, io, args[2].Pointer(), &pgID, usermem.IOOpts{
-			AddressSpaceActive: true,
-		}); err != nil {
+		var pgIDP primitive.Int32
+		if _, err := pgIDP.CopyIn(task, args[2].Pointer()); err != nil {
 			return 0, err
 		}
+		pgID := kernel.ProcessGroupID(pgIDP)
 
 		// pgID must be non-negative.
 		if pgID < 0 {
@@ -260,9 +256,7 @@ func (t *TTYFileDescription) Ioctl(ctx context.Context, io usermem.IO, args arch
 		if err != nil {
 			return 0, err
 		}
-		_, err = usermem.CopyObjectOut(ctx, io, args[2].Pointer(), winsize, usermem.IOOpts{
-			AddressSpaceActive: true,
-		})
+		_, err = winsize.CopyOut(task, args[2].Pointer())
 		return 0, err
 
 	case linux.TIOCSWINSZ:
@@ -273,9 +267,7 @@ func (t *TTYFileDescription) Ioctl(ctx context.Context, io usermem.IO, args arch
 		// set the winsize.
 
 		var winsize linux.Winsize
-		if _, err := usermem.CopyObjectIn(ctx, io, args[2].Pointer(), &winsize, usermem.IOOpts{
-			AddressSpaceActive: true,
-		}); err != nil {
+		if _, err := winsize.CopyIn(task, args[2].Pointer()); err != nil {
 			return 0, err
 		}
 		err := ioctlSetWinsize(fd, &winsize)

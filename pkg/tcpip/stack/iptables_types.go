@@ -15,6 +15,7 @@
 package stack
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 
@@ -36,7 +37,6 @@ import (
 // ----->[Prerouting]----->routing----->[Forward]---------[Postrouting]----->
 type Hook uint
 
-// These values correspond to values in include/uapi/linux/netfilter.h.
 const (
 	// Prerouting happens before a packet is routed to applications or to
 	// be forwarded.
@@ -81,31 +81,60 @@ const (
 //
 // +stateify savable
 type IPTables struct {
-	// mu protects tables, priorities, and modified.
+	// mu protects v4Tables, v6Tables, and modified.
 	mu sync.RWMutex
-
-	// tables maps tableIDs to tables. Holds builtin tables only, not user
-	// tables. mu must be locked for accessing.
-	tables [numTables]Table
-
-	// priorities maps each hook to a list of table names. The order of the
-	// list is the order in which each table should be visited for that
-	// hook. mu needs to be locked for accessing.
-	priorities [NumHooks][]tableID
-
+	// v4Tables and v6tables map tableIDs to tables. They hold builtin
+	// tables only, not user tables. mu must be locked for accessing.
+	v4Tables [NumTables]Table
+	v6Tables [NumTables]Table
 	// modified is whether tables have been modified at least once. It is
 	// used to elide the iptables performance overhead for workloads that
 	// don't utilize iptables.
 	modified bool
 
+	// priorities maps each hook to a list of table names. The order of the
+	// list is the order in which each table should be visited for that
+	// hook. It is immutable.
+	priorities [NumHooks][]TableID
+
 	connections ConnTrack
 
-	// reaperDone can be signalled to stop the reaper goroutine.
+	// reaperDone can be signaled to stop the reaper goroutine.
 	reaperDone chan struct{}
 }
 
-// A Table defines a set of chains and hooks into the network stack. It is
-// really just a list of rules.
+// VisitTargets traverses all the targets of all tables and replaces each with
+// transform(target).
+func (it *IPTables) VisitTargets(transform func(Target) Target) {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+
+	for tid := range it.v4Tables {
+		for i, rule := range it.v4Tables[tid].Rules {
+			it.v4Tables[tid].Rules[i].Target = transform(rule.Target)
+		}
+	}
+	for tid := range it.v6Tables {
+		for i, rule := range it.v6Tables[tid].Rules {
+			it.v6Tables[tid].Rules[i].Target = transform(rule.Target)
+		}
+	}
+}
+
+// A Table defines a set of chains and hooks into the network stack.
+//
+// It is a list of Rules, entry points (BuiltinChains), and error handlers
+// (Underflows). As packets traverse netstack, they hit hooks. When a packet
+// hits a hook, iptables compares it to Rules starting from that hook's entry
+// point. So if a packet hits the Input hook, we look up the corresponding
+// entry point in BuiltinChains and jump to that point.
+//
+// If the Rule doesn't match the packet, iptables continues to the next Rule.
+// If a Rule does match, it can issue a verdict on the packet (e.g. RuleAccept
+// or RuleDrop) that causes the packet to stop traversing iptables. It can also
+// jump to other rules or perform custom actions based on Rule.Target.
+//
+// Underflow Rules are invoked when a chain returns without reaching a verdict.
 //
 // +stateify savable
 type Table struct {
@@ -148,12 +177,16 @@ type Rule struct {
 	Target Target
 }
 
-// IPHeaderFilter holds basic IP filtering data common to every rule.
+// IPHeaderFilter performs basic IP header matching common to every rule.
 //
 // +stateify savable
 type IPHeaderFilter struct {
 	// Protocol matches the transport protocol.
 	Protocol tcpip.TransportProtocolNumber
+
+	// CheckProtocol determines whether the Protocol field should be
+	// checked during matching.
+	CheckProtocol bool
 
 	// Dst matches the destination IP address.
 	Dst tcpip.Address
@@ -191,16 +224,43 @@ type IPHeaderFilter struct {
 	OutputInterfaceInvert bool
 }
 
-// match returns whether hdr matches the filter.
-func (fl IPHeaderFilter) match(hdr header.IPv4, hook Hook, nicName string) bool {
-	// TODO(gvisor.dev/issue/170): Support other fields of the filter.
+// match returns whether pkt matches the filter.
+//
+// Preconditions: pkt.NetworkHeader is set and is at least of the minimal IPv4
+// or IPv6 header length.
+func (fl IPHeaderFilter) match(pkt *PacketBuffer, hook Hook, nicName string) bool {
+	// Extract header fields.
+	var (
+		// TODO(gvisor.dev/issue/170): Support other filter fields.
+		transProto tcpip.TransportProtocolNumber
+		dstAddr    tcpip.Address
+		srcAddr    tcpip.Address
+	)
+	switch proto := pkt.NetworkProtocolNumber; proto {
+	case header.IPv4ProtocolNumber:
+		hdr := header.IPv4(pkt.NetworkHeader().View())
+		transProto = hdr.TransportProtocol()
+		dstAddr = hdr.DestinationAddress()
+		srcAddr = hdr.SourceAddress()
+
+	case header.IPv6ProtocolNumber:
+		hdr := header.IPv6(pkt.NetworkHeader().View())
+		transProto = hdr.TransportProtocol()
+		dstAddr = hdr.DestinationAddress()
+		srcAddr = hdr.SourceAddress()
+
+	default:
+		panic(fmt.Sprintf("unknown network protocol with EtherType: %d", proto))
+	}
+
 	// Check the transport protocol.
-	if fl.Protocol != 0 && fl.Protocol != hdr.TransportProtocol() {
+	if fl.CheckProtocol && fl.Protocol != transProto {
 		return false
 	}
 
-	// Check the source and destination IPs.
-	if !filterAddress(hdr.DestinationAddress(), fl.DstMask, fl.Dst, fl.DstInvert) || !filterAddress(hdr.SourceAddress(), fl.SrcMask, fl.Src, fl.SrcInvert) {
+	// Check the addresses.
+	if !filterAddress(dstAddr, fl.DstMask, fl.Dst, fl.DstInvert) ||
+		!filterAddress(srcAddr, fl.SrcMask, fl.Src, fl.SrcInvert) {
 		return false
 	}
 
@@ -226,6 +286,18 @@ func (fl IPHeaderFilter) match(hdr header.IPv4, hook Hook, nicName string) bool 
 	}
 
 	return true
+}
+
+// NetworkProtocol returns the protocol (IPv4 or IPv6) on to which the header
+// applies.
+func (fl IPHeaderFilter) NetworkProtocol() tcpip.NetworkProtocolNumber {
+	switch len(fl.Src) {
+	case header.IPv4AddressSize:
+		return header.IPv4ProtocolNumber
+	case header.IPv6AddressSize:
+		return header.IPv6ProtocolNumber
+	}
+	panic(fmt.Sprintf("invalid address in IPHeaderFilter: %s", fl.Src))
 }
 
 // filterAddress returns whether addr matches the filter.

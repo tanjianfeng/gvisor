@@ -19,6 +19,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
 
 type headerType int
@@ -80,10 +81,16 @@ type PacketBuffer struct {
 	// data are held in the same underlying buffer storage.
 	header buffer.Prependable
 
-	// NetworkProtocol is only valid when NetworkHeader is set.
+	// NetworkProtocolNumber is only valid when NetworkHeader().View().IsEmpty()
+	// returns false.
 	// TODO(gvisor.dev/issue/3574): Remove the separately passed protocol
 	// numbers in registration APIs that take a PacketBuffer.
 	NetworkProtocolNumber tcpip.NetworkProtocolNumber
+
+	// TransportProtocol is only valid if it is non zero.
+	// TODO(gvisor.dev/issue/3810): This and the network protocol number should
+	// be moved into the headerinfo. This should resolve the validity issue.
+	TransportProtocolNumber tcpip.TransportProtocolNumber
 
 	// Hash is the transport layer hash of this packet. A value of zero
 	// indicates no valid hash has been set.
@@ -234,18 +241,33 @@ func (pk *PacketBuffer) consume(typ headerType, size int) (v buffer.View, consum
 // underlying packet payload.
 func (pk *PacketBuffer) Clone() *PacketBuffer {
 	newPk := &PacketBuffer{
-		PacketBufferEntry:     pk.PacketBufferEntry,
-		Data:                  pk.Data.Clone(nil),
-		headers:               pk.headers,
-		header:                pk.header,
-		Hash:                  pk.Hash,
-		Owner:                 pk.Owner,
-		EgressRoute:           pk.EgressRoute,
-		GSOOptions:            pk.GSOOptions,
-		NetworkProtocolNumber: pk.NetworkProtocolNumber,
-		NatDone:               pk.NatDone,
+		PacketBufferEntry:       pk.PacketBufferEntry,
+		Data:                    pk.Data.Clone(nil),
+		headers:                 pk.headers,
+		header:                  pk.header,
+		Hash:                    pk.Hash,
+		Owner:                   pk.Owner,
+		EgressRoute:             pk.EgressRoute,
+		GSOOptions:              pk.GSOOptions,
+		NetworkProtocolNumber:   pk.NetworkProtocolNumber,
+		NatDone:                 pk.NatDone,
+		TransportProtocolNumber: pk.TransportProtocolNumber,
 	}
 	return newPk
+}
+
+// Network returns the network header as a header.Network.
+//
+// Network should only be called when NetworkHeader has been set.
+func (pk *PacketBuffer) Network() header.Network {
+	switch netProto := pk.NetworkProtocolNumber; netProto {
+	case header.IPv4ProtocolNumber:
+		return header.IPv4(pk.NetworkHeader().View())
+	case header.IPv6ProtocolNumber:
+		return header.IPv6(pk.NetworkHeader().View())
+	default:
+		panic(fmt.Sprintf("unknown network protocol number %d", netProto))
+	}
 }
 
 // headerInfo stores metadata about a header in a packet.
@@ -289,11 +311,25 @@ func (h PacketHeader) Consume(size int) (v buffer.View, consumed bool) {
 }
 
 // PayloadSince returns packet payload starting from and including a particular
-// header. This method isn't optimized and should be used in test only.
+// header.
+//
+// The returned View is owned by the caller - its backing buffer is separate
+// from the packet header's underlying packet buffer.
 func PayloadSince(h PacketHeader) buffer.View {
-	var v buffer.View
+	size := h.pk.Data.Size()
+	for _, hinfo := range h.pk.headers[h.typ:] {
+		size += len(hinfo.buf)
+	}
+
+	v := make(buffer.View, 0, size)
+
 	for _, hinfo := range h.pk.headers[h.typ:] {
 		v = append(v, hinfo.buf...)
 	}
-	return append(v, h.pk.Data.ToView()...)
+
+	for _, view := range h.pk.Data.Views() {
+		v = append(v, view...)
+	}
+
+	return v
 }

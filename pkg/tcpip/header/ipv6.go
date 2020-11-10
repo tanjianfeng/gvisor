@@ -34,6 +34,9 @@ const (
 	hopLimit             = 7
 	v6SrcAddr            = 8
 	v6DstAddr            = v6SrcAddr + IPv6AddressSize
+
+	// IPv6FixedHeaderSize is the size of the fixed header.
+	IPv6FixedHeaderSize = v6DstAddr + IPv6AddressSize
 )
 
 // IPv6Fields contains the fields of an IPv6 packet. It is used to describe the
@@ -69,10 +72,14 @@ type IPv6 []byte
 
 const (
 	// IPv6MinimumSize is the minimum size of a valid IPv6 packet.
-	IPv6MinimumSize = 40
+	IPv6MinimumSize = IPv6FixedHeaderSize
 
 	// IPv6AddressSize is the size, in bytes, of an IPv6 address.
 	IPv6AddressSize = 16
+
+	// IPv6MaximumPayloadSize is the maximum size of a valid IPv6 payload per
+	// RFC 8200 Section 4.5.
+	IPv6MaximumPayloadSize = 65535
 
 	// IPv6ProtocolNumber is IPv6's network protocol number.
 	IPv6ProtocolNumber tcpip.NetworkProtocolNumber = 0x86dd
@@ -94,8 +101,10 @@ const (
 	// The address is ff02::2.
 	IPv6AllRoutersMulticastAddress tcpip.Address = "\xff\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
 
-	// IPv6MinimumMTU is the minimum MTU required by IPv6, per RFC 2460,
-	// section 5.
+	// IPv6MinimumMTU is the minimum MTU required by IPv6, per RFC 8200,
+	// section 5:
+	//   IPv6 requires that every link in the Internet have an MTU of 1280 octets
+	//   or greater.  This is known as the IPv6 minimum link MTU.
 	IPv6MinimumMTU = 1280
 
 	// IPv6Loopback is the IPv6 Loopback address.
@@ -302,12 +311,19 @@ func IsV6UnicastAddress(addr tcpip.Address) bool {
 	return addr[0] != 0xff
 }
 
+const solicitedNodeMulticastPrefix = "\xff\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\xff"
+
 // SolicitedNodeAddr computes the solicited-node multicast address. This is
 // used for NDP. Described in RFC 4291. The argument must be a full-length IPv6
 // address.
 func SolicitedNodeAddr(addr tcpip.Address) tcpip.Address {
-	const solicitedNodeMulticastPrefix = "\xff\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\xff"
 	return solicitedNodeMulticastPrefix + addr[len(addr)-3:]
+}
+
+// IsSolicitedNodeAddr determines whether the address is a solicited-node
+// multicast address.
+func IsSolicitedNodeAddr(addr tcpip.Address) bool {
+	return solicitedNodeMulticastPrefix == addr[:len(addr)-3]
 }
 
 // EthernetAdddressToModifiedEUI64IntoBuf populates buf with a modified EUI-64
@@ -357,6 +373,12 @@ func IsV6LinkLocalAddress(addr tcpip.Address) bool {
 		return false
 	}
 	return addr[0] == 0xfe && (addr[1]&0xc0) == 0x80
+}
+
+// IsV6LoopbackAddress determines if the provided address is an IPv6 loopback
+// address.
+func IsV6LoopbackAddress(addr tcpip.Address) bool {
+	return addr == IPv6Loopback
 }
 
 // IsV6LinkLocalMulticastAddress determines if the provided address is an IPv6

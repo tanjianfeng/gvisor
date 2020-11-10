@@ -35,6 +35,7 @@ import (
 // +stateify savable
 type DynamicBytesFile struct {
 	InodeAttrs
+	InodeNoStatFS
 	InodeNoopRefCount
 	InodeNotDirectory
 	InodeNotSymlink
@@ -46,18 +47,18 @@ type DynamicBytesFile struct {
 var _ Inode = (*DynamicBytesFile)(nil)
 
 // Init initializes a dynamic bytes file.
-func (f *DynamicBytesFile) Init(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, data vfs.DynamicBytesSource, perm linux.FileMode) {
+func (f *DynamicBytesFile) Init(ctx context.Context, creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, data vfs.DynamicBytesSource, perm linux.FileMode) {
 	if perm&^linux.PermissionsMask != 0 {
 		panic(fmt.Sprintf("Only permission mask must be set: %x", perm&linux.PermissionsMask))
 	}
-	f.InodeAttrs.Init(creds, devMajor, devMinor, ino, linux.ModeRegular|perm)
+	f.InodeAttrs.Init(ctx, creds, devMajor, devMinor, ino, linux.ModeRegular|perm)
 	f.data = data
 }
 
 // Open implements Inode.Open.
-func (f *DynamicBytesFile) Open(ctx context.Context, rp *vfs.ResolvingPath, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+func (f *DynamicBytesFile) Open(ctx context.Context, rp *vfs.ResolvingPath, d *Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	fd := &DynamicBytesFD{}
-	if err := fd.Init(rp.Mount(), vfsd, f.data, &f.locks, opts.Flags); err != nil {
+	if err := fd.Init(rp.Mount(), d, f.data, &f.locks, opts.Flags); err != nil {
 		return nil, err
 	}
 	return &fd.vfsfd, nil
@@ -86,12 +87,12 @@ type DynamicBytesFD struct {
 }
 
 // Init initializes a DynamicBytesFD.
-func (fd *DynamicBytesFD) Init(m *vfs.Mount, d *vfs.Dentry, data vfs.DynamicBytesSource, locks *vfs.FileLocks, flags uint32) error {
+func (fd *DynamicBytesFD) Init(m *vfs.Mount, d *Dentry, data vfs.DynamicBytesSource, locks *vfs.FileLocks, flags uint32) error {
 	fd.LockFD.Init(locks)
-	if err := fd.vfsfd.Init(fd, flags, m, d, &vfs.FileDescriptionOptions{}); err != nil {
+	if err := fd.vfsfd.Init(fd, flags, m, d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
 		return err
 	}
-	fd.inode = d.Impl().(*Dentry).inode
+	fd.inode = d.inode
 	fd.SetDataSource(data)
 	return nil
 }

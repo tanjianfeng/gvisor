@@ -84,6 +84,7 @@ func (p *proc) newTaskDir(t *kernel.Task, msrc *fs.MountSource, isThreadGroup bo
 		"auxv":          newAuxvec(t, msrc),
 		"cmdline":       newExecArgInode(t, msrc, cmdlineExecArg),
 		"comm":          newComm(t, msrc),
+		"cwd":           newCwd(t, msrc),
 		"environ":       newExecArgInode(t, msrc, environExecArg),
 		"exe":           newExe(t, msrc),
 		"fd":            newFdDir(t, msrc),
@@ -91,6 +92,7 @@ func (p *proc) newTaskDir(t *kernel.Task, msrc *fs.MountSource, isThreadGroup bo
 		"gid_map":       newGIDMap(t, msrc),
 		"io":            newIO(t, msrc, isThreadGroup),
 		"maps":          newMaps(t, msrc),
+		"mem":           newMem(t, msrc),
 		"mountinfo":     seqfile.NewSeqFileInode(t, &mountInfoFile{t: t}, msrc),
 		"mounts":        seqfile.NewSeqFileInode(t, &mountsFile{t: t}, msrc),
 		"net":           newNetDir(t, msrc),
@@ -300,6 +302,49 @@ func (e *exe) Readlink(ctx context.Context, inode *fs.Inode) (string, error) {
 	return exec.PathnameWithDeleted(ctx), nil
 }
 
+// cwd is an fs.InodeOperations symlink for the /proc/PID/cwd file.
+//
+// +stateify savable
+type cwd struct {
+	ramfs.Symlink
+
+	t *kernel.Task
+}
+
+func newCwd(t *kernel.Task, msrc *fs.MountSource) *fs.Inode {
+	cwdSymlink := &cwd{
+		Symlink: *ramfs.NewSymlink(t, fs.RootOwner, ""),
+		t:       t,
+	}
+	return newProcInode(t, cwdSymlink, msrc, fs.Symlink, t)
+}
+
+// Readlink implements fs.InodeOperations.
+func (e *cwd) Readlink(ctx context.Context, inode *fs.Inode) (string, error) {
+	if !kernel.ContextCanTrace(ctx, e.t, false) {
+		return "", syserror.EACCES
+	}
+	if err := checkTaskState(e.t); err != nil {
+		return "", err
+	}
+	cwd := e.t.FSContext().WorkingDirectory()
+	if cwd == nil {
+		// It could have raced with process deletion.
+		return "", syserror.ESRCH
+	}
+	defer cwd.DecRef(ctx)
+
+	root := fs.RootFromContext(ctx)
+	if root == nil {
+		// It could have raced with process deletion.
+		return "", syserror.ESRCH
+	}
+	defer root.DecRef(ctx)
+
+	name, _ := cwd.FullName(root)
+	return name, nil
+}
+
 // namespaceSymlink represents a symlink in the namespacefs, such as the files
 // in /proc/<pid>/ns.
 //
@@ -353,6 +398,88 @@ func newNamespaceDir(t *kernel.Task, msrc *fs.MountSource) *fs.Inode {
 	}
 	d := ramfs.NewDir(t, contents, fs.RootOwner, fs.FilePermsFromMode(0511))
 	return newProcInode(t, d, msrc, fs.SpecialDirectory, t)
+}
+
+// memData implements fs.Inode for /proc/[pid]/mem.
+//
+// +stateify savable
+type memData struct {
+	fsutil.SimpleFileInode
+
+	t *kernel.Task
+}
+
+// memDataFile implements fs.FileOperations for /proc/[pid]/mem.
+//
+// +stateify savable
+type memDataFile struct {
+	fsutil.FileGenericSeek          `state:"nosave"`
+	fsutil.FileNoIoctl              `state:"nosave"`
+	fsutil.FileNoMMap               `state:"nosave"`
+	fsutil.FileNoWrite              `state:"nosave"`
+	fsutil.FileNoSplice             `state:"nosave"`
+	fsutil.FileNoopFlush            `state:"nosave"`
+	fsutil.FileNoopFsync            `state:"nosave"`
+	fsutil.FileNoopRelease          `state:"nosave"`
+	fsutil.FileNotDirReaddir        `state:"nosave"`
+	fsutil.FileUseInodeUnstableAttr `state:"nosave"`
+	waiter.AlwaysReady              `state:"nosave"`
+
+	t *kernel.Task
+}
+
+func newMem(t *kernel.Task, msrc *fs.MountSource) *fs.Inode {
+	inode := &memData{
+		SimpleFileInode: *fsutil.NewSimpleFileInode(t, fs.RootOwner, fs.FilePermsFromMode(0400), linux.PROC_SUPER_MAGIC),
+		t:               t,
+	}
+	return newProcInode(t, inode, msrc, fs.SpecialFile, t)
+}
+
+// Truncate implements fs.InodeOperations.Truncate.
+func (m *memData) Truncate(context.Context, *fs.Inode, int64) error {
+	return nil
+}
+
+// GetFile implements fs.InodeOperations.GetFile.
+func (m *memData) GetFile(ctx context.Context, dirent *fs.Dirent, flags fs.FileFlags) (*fs.File, error) {
+	// TODO(gvisor.dev/issue/260): Add check for PTRACE_MODE_ATTACH_FSCREDS
+	// Permission to read this file is governed by PTRACE_MODE_ATTACH_FSCREDS
+	// Since we dont implement setfsuid/setfsgid we can just use PTRACE_MODE_ATTACH
+	if !kernel.ContextCanTrace(ctx, m.t, true) {
+		return nil, syserror.EACCES
+	}
+	if err := checkTaskState(m.t); err != nil {
+		return nil, err
+	}
+	// Enable random access reads
+	flags.Pread = true
+	return fs.NewFile(ctx, dirent, flags, &memDataFile{t: m.t}), nil
+}
+
+// Read implements fs.FileOperations.Read.
+func (m *memDataFile) Read(ctx context.Context, _ *fs.File, dst usermem.IOSequence, offset int64) (int64, error) {
+	if dst.NumBytes() == 0 {
+		return 0, nil
+	}
+	mm, err := getTaskMM(m.t)
+	if err != nil {
+		return 0, nil
+	}
+	defer mm.DecUsers(ctx)
+	// Buffer the read data because of MM locks
+	buf := make([]byte, dst.NumBytes())
+	n, readErr := mm.CopyIn(ctx, usermem.Addr(offset), buf, usermem.IOOpts{IgnorePermissions: true})
+	if n > 0 {
+		if _, err := dst.CopyOut(ctx, buf[:n]); err != nil {
+			return 0, syserror.EFAULT
+		}
+		return int64(n), nil
+	}
+	if readErr != nil {
+		return 0, syserror.EIO
+	}
+	return 0, nil
 }
 
 // mapsData implements seqfile.SeqSource for /proc/[pid]/maps.
@@ -604,7 +731,7 @@ func (s *statusData) ReadSeqFileData(ctx context.Context, h seqfile.SeqHandle) (
 	var vss, rss, data uint64
 	s.t.WithMuLocked(func(t *kernel.Task) {
 		if fdTable := t.FDTable(); fdTable != nil {
-			fds = fdTable.Size()
+			fds = fdTable.CurrentMaxFDs()
 		}
 		if mm := t.MemoryManager(); mm != nil {
 			vss = mm.VirtualMemorySize()

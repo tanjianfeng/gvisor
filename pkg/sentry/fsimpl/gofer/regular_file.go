@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"sync"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -31,6 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -39,11 +39,12 @@ func (d *dentry) isRegularFile() bool {
 	return d.fileType() == linux.S_IFREG
 }
 
+// +stateify savable
 type regularFileFD struct {
 	fileDescription
 
 	// off is the file offset. off is protected by mu.
-	mu  sync.Mutex
+	mu  sync.Mutex `state:"nosave"`
 	off int64
 }
 
@@ -56,10 +57,16 @@ func (fd *regularFileFD) OnClose(ctx context.Context) error {
 	if !fd.vfsfd.IsWritable() {
 		return nil
 	}
-	// Skip flushing if writes may be buffered by the client, since (as with
-	// the VFS1 client) we don't flush buffered writes on close anyway.
+	// Skip flushing if there are client-buffered writes, since (as with the
+	// VFS1 client) we don't flush buffered writes on close anyway.
 	d := fd.dentry()
-	if d.fs.opts.interop == InteropModeExclusive {
+	if d.fs.opts.interop != InteropModeExclusive {
+		return nil
+	}
+	d.dataMu.RLock()
+	haveDirtyPages := !d.dirty.IsEmpty()
+	d.dataMu.RUnlock()
+	if haveDirtyPages {
 		return nil
 	}
 	d.handleMu.RLock()
@@ -73,28 +80,11 @@ func (fd *regularFileFD) OnClose(ctx context.Context) error {
 // Allocate implements vfs.FileDescriptionImpl.Allocate.
 func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
 	d := fd.dentry()
-	d.metadataMu.Lock()
-	defer d.metadataMu.Unlock()
-
-	// Allocating a smaller size is a noop.
-	size := offset + length
-	if d.cachedMetadataAuthoritative() && size <= d.size {
-		return nil
-	}
-
-	d.handleMu.RLock()
-	err := d.writeFile.allocate(ctx, p9.ToAllocateMode(mode), offset, length)
-	d.handleMu.RUnlock()
-	if err != nil {
-		return err
-	}
-	d.dataMu.Lock()
-	atomic.StoreUint64(&d.size, size)
-	d.dataMu.Unlock()
-	if d.cachedMetadataAuthoritative() {
-		d.touchCMtimeLocked()
-	}
-	return nil
+	return d.doAllocate(ctx, offset, length, func() error {
+		d.handleMu.RLock()
+		defer d.handleMu.RUnlock()
+		return d.writeFile.allocate(ctx, p9.ToAllocateMode(mode), offset, length)
+	})
 }
 
 // PRead implements vfs.FileDescriptionImpl.PRead.
@@ -117,6 +107,10 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		return 0, io.EOF
 	}
 
+	var (
+		n       int64
+		readErr error
+	)
 	if fd.vfsfd.StatusFlags()&linux.O_DIRECT != 0 {
 		// Lock d.metadataMu for the rest of the read to prevent d.size from
 		// changing.
@@ -127,20 +121,25 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		if err := d.writeback(ctx, offset, dst.NumBytes()); err != nil {
 			return 0, err
 		}
-	}
-
-	rw := getDentryReadWriter(ctx, d, offset)
-	if fd.vfsfd.StatusFlags()&linux.O_DIRECT != 0 {
+		rw := getDentryReadWriter(ctx, d, offset)
 		// Require the read to go to the remote file.
 		rw.direct = true
+		n, readErr = dst.CopyOutFrom(ctx, rw)
+		putDentryReadWriter(rw)
+		if d.fs.opts.interop != InteropModeShared {
+			// Compare Linux's mm/filemap.c:do_generic_file_read() => file_accessed().
+			d.touchAtimeLocked(fd.vfsfd.Mount())
+		}
+	} else {
+		rw := getDentryReadWriter(ctx, d, offset)
+		n, readErr = dst.CopyOutFrom(ctx, rw)
+		putDentryReadWriter(rw)
+		if d.fs.opts.interop != InteropModeShared {
+			// Compare Linux's mm/filemap.c:do_generic_file_read() => file_accessed().
+			d.touchAtime(fd.vfsfd.Mount())
+		}
 	}
-	n, err := dst.CopyOutFrom(ctx, rw)
-	putDentryReadWriter(rw)
-	if d.fs.opts.interop != InteropModeShared {
-		// Compare Linux's mm/filemap.c:do_generic_file_read() => file_accessed().
-		d.touchAtime(fd.vfsfd.Mount())
-	}
-	return n, err
+	return n, readErr
 }
 
 // Read implements vfs.FileDescriptionImpl.Read.
@@ -396,7 +395,7 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 					End:   gapEnd,
 				}
 				optMR := gap.Range()
-				err := rw.d.cache.Fill(rw.ctx, reqMR, maxFillRange(reqMR, optMR), mf, usage.PageCache, h.readToBlocksAt)
+				err := rw.d.cache.Fill(rw.ctx, reqMR, maxFillRange(reqMR, optMR), rw.d.size, mf, usage.PageCache, h.readToBlocksAt)
 				mf.MarkEvictable(rw.d, pgalloc.EvictableRange{optMR.Start, optMR.End})
 				seg, gap = rw.d.cache.Find(rw.off)
 				if !seg.Ok() {
@@ -404,10 +403,10 @@ func (rw *dentryReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, error) 
 					rw.d.handleMu.RUnlock()
 					return done, err
 				}
-				// err might have occurred in part of gap.Range() outside
-				// gapMR. Forget about it for now; if the error matters and
-				// persists, we'll run into it again in a later iteration of
-				// this loop.
+				// err might have occurred in part of gap.Range() outside gapMR
+				// (in particular, gap.End() might be beyond EOF). Forget about
+				// it for now; if the error matters and persists, we'll run
+				// into it again in a later iteration of this loop.
 			} else {
 				// Read directly from the file.
 				gapDsts := dsts.TakeFirst64(gapMR.Length())
@@ -625,23 +624,7 @@ func regularFileSeekLocked(ctx context.Context, d *dentry, fdOffset, offset int6
 
 // Sync implements vfs.FileDescriptionImpl.Sync.
 func (fd *regularFileFD) Sync(ctx context.Context) error {
-	return fd.dentry().syncCachedFile(ctx)
-}
-
-func (d *dentry) syncCachedFile(ctx context.Context) error {
-	d.handleMu.RLock()
-	defer d.handleMu.RUnlock()
-
-	if h := d.writeHandleLocked(); h.isOpen() {
-		d.dataMu.Lock()
-		// Write dirty cached data to the remote file.
-		err := fsutil.SyncDirtyAll(ctx, &d.cache, &d.dirty, d.size, d.fs.mfp.MemoryFile(), h.writeFromBlocksAt)
-		d.dataMu.Unlock()
-		if err != nil {
-			return err
-		}
-	}
-	return d.syncRemoteFileLocked(ctx)
+	return fd.dentry().syncCachedFile(ctx, false /* lowSyncExpectations */)
 }
 
 // ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
@@ -781,7 +764,7 @@ func (d *dentry) Translate(ctx context.Context, required, optional memmap.Mappab
 
 	mf := d.fs.mfp.MemoryFile()
 	h := d.readHandleLocked()
-	cerr := d.cache.Fill(ctx, required, maxFillRange(required, optional), mf, usage.PageCache, h.readToBlocksAt)
+	cerr := d.cache.Fill(ctx, required, maxFillRange(required, optional), d.size, mf, usage.PageCache, h.readToBlocksAt)
 
 	var ts []memmap.Translation
 	var translatedEnd uint64
@@ -900,6 +883,8 @@ func (d *dentry) Evict(ctx context.Context, er pgalloc.EvictableRange) {
 // dentryPlatformFile is only used when a host FD representing the remote file
 // is available (i.e. dentry.hostFD >= 0), and that FD is used for application
 // memory mappings (i.e. !filesystem.opts.forcePageCache).
+//
+// +stateify savable
 type dentryPlatformFile struct {
 	*dentry
 
@@ -912,7 +897,7 @@ type dentryPlatformFile struct {
 	hostFileMapper fsutil.HostFileMapper
 
 	// hostFileMapperInitOnce is used to lazily initialize hostFileMapper.
-	hostFileMapperInitOnce sync.Once
+	hostFileMapperInitOnce sync.Once `state:"nosave"`
 }
 
 // IncRef implements memmap.File.IncRef.

@@ -24,10 +24,13 @@ import (
 
 // StaticSymlink provides an Inode implementation for symlinks that point to
 // a immutable target.
+//
+// +stateify savable
 type StaticSymlink struct {
 	InodeAttrs
 	InodeNoopRefCount
 	InodeSymlink
+	InodeNoStatFS
 
 	target string
 }
@@ -35,23 +38,20 @@ type StaticSymlink struct {
 var _ Inode = (*StaticSymlink)(nil)
 
 // NewStaticSymlink creates a new symlink file pointing to 'target'.
-func NewStaticSymlink(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, target string) *Dentry {
+func NewStaticSymlink(ctx context.Context, creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, target string) Inode {
 	inode := &StaticSymlink{}
-	inode.Init(creds, devMajor, devMinor, ino, target)
-
-	d := &Dentry{}
-	d.Init(inode)
-	return d
+	inode.Init(ctx, creds, devMajor, devMinor, ino, target)
+	return inode
 }
 
 // Init initializes the instance.
-func (s *StaticSymlink) Init(creds *auth.Credentials, devMajor uint32, devMinor uint32, ino uint64, target string) {
+func (s *StaticSymlink) Init(ctx context.Context, creds *auth.Credentials, devMajor uint32, devMinor uint32, ino uint64, target string) {
 	s.target = target
-	s.InodeAttrs.Init(creds, devMajor, devMinor, ino, linux.ModeSymlink|0777)
+	s.InodeAttrs.Init(ctx, creds, devMajor, devMinor, ino, linux.ModeSymlink|0777)
 }
 
-// Readlink implements Inode.
-func (s *StaticSymlink) Readlink(_ context.Context) (string, error) {
+// Readlink implements Inode.Readlink.
+func (s *StaticSymlink) Readlink(_ context.Context, _ *vfs.Mount) (string, error) {
 	return s.target, nil
 }
 

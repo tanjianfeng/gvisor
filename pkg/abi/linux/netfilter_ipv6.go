@@ -17,9 +17,9 @@ package linux
 import (
 	"io"
 
+	"gvisor.dev/gvisor/pkg/marshal"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/usermem"
-	"gvisor.dev/gvisor/tools/go_marshal/marshal"
-	"gvisor.dev/gvisor/tools/go_marshal/primitive"
 )
 
 // This file contains structures required to support IPv6 netfilter and
@@ -128,9 +128,9 @@ func (ke *KernelIP6TGetEntries) UnmarshalUnsafe(src []byte) {
 }
 
 // CopyIn implements marshal.Marshallable.CopyIn.
-func (ke *KernelIP6TGetEntries) CopyIn(task marshal.Task, addr usermem.Addr) (int, error) {
-	buf := task.CopyScratchBuffer(ke.SizeBytes()) // escapes: okay.
-	length, err := task.CopyInBytes(addr, buf)    // escapes: okay.
+func (ke *KernelIP6TGetEntries) CopyIn(cc marshal.CopyContext, addr usermem.Addr) (int, error) {
+	buf := cc.CopyScratchBuffer(ke.SizeBytes()) // escapes: okay.
+	length, err := cc.CopyInBytes(addr, buf)    // escapes: okay.
 	// Unmarshal unconditionally. If we had a short copy-in, this results
 	// in a partially unmarshalled struct.
 	ke.UnmarshalBytes(buf) // escapes: fallback.
@@ -138,21 +138,21 @@ func (ke *KernelIP6TGetEntries) CopyIn(task marshal.Task, addr usermem.Addr) (in
 }
 
 // CopyOut implements marshal.Marshallable.CopyOut.
-func (ke *KernelIP6TGetEntries) CopyOut(task marshal.Task, addr usermem.Addr) (int, error) {
+func (ke *KernelIP6TGetEntries) CopyOut(cc marshal.CopyContext, addr usermem.Addr) (int, error) {
 	// Type KernelIP6TGetEntries doesn't have a packed layout in memory,
 	// fall back to MarshalBytes.
-	return task.CopyOutBytes(addr, ke.marshalAll(task))
+	return cc.CopyOutBytes(addr, ke.marshalAll(cc))
 }
 
 // CopyOutN implements marshal.Marshallable.CopyOutN.
-func (ke *KernelIP6TGetEntries) CopyOutN(task marshal.Task, addr usermem.Addr, limit int) (int, error) {
+func (ke *KernelIP6TGetEntries) CopyOutN(cc marshal.CopyContext, addr usermem.Addr, limit int) (int, error) {
 	// Type KernelIP6TGetEntries doesn't have a packed layout in memory, fall
 	// back to MarshalBytes.
-	return task.CopyOutBytes(addr, ke.marshalAll(task)[:limit])
+	return cc.CopyOutBytes(addr, ke.marshalAll(cc)[:limit])
 }
 
-func (ke *KernelIP6TGetEntries) marshalAll(task marshal.Task) []byte {
-	buf := task.CopyScratchBuffer(ke.SizeBytes())
+func (ke *KernelIP6TGetEntries) marshalAll(cc marshal.CopyContext) []byte {
+	buf := cc.CopyScratchBuffer(ke.SizeBytes())
 	ke.MarshalBytes(buf)
 	return buf
 }
@@ -290,6 +290,19 @@ type IP6TIP struct {
 
 const SizeOfIP6TIP = 136
 
+// Flags in IP6TIP.Flags. Corresponding constants are in
+// include/uapi/linux/netfilter_ipv6/ip6_tables.h.
+const (
+	// Whether to check the Protocol field.
+	IP6T_F_PROTO = 0x01
+	// Whether to match the TOS field.
+	IP6T_F_TOS = 0x02
+	// Indicates that the jump target is an aboslute GOTO, not an offset.
+	IP6T_F_GOTO = 0x04
+	// Enables all flags.
+	IP6T_F_MASK = 0x07
+)
+
 // Flags in IP6TIP.InverseFlags. Corresponding constants are in
 // include/uapi/linux/netfilter_ipv6/ip6_tables.h.
 const (
@@ -308,3 +321,16 @@ const (
 	// Enable all flags.
 	IP6T_INV_MASK = 0x7F
 )
+
+// NFNATRange corresponds to struct nf_nat_range in
+// include/uapi/linux/netfilter/nf_nat.h.
+type NFNATRange struct {
+	Flags    uint32
+	MinAddr  Inet6Addr
+	MaxAddr  Inet6Addr
+	MinProto uint16 // Network byte order.
+	MaxProto uint16 // Network byte order.
+}
+
+// SizeOfNFNATRange is the size of NFNATRange.
+const SizeOfNFNATRange = 40

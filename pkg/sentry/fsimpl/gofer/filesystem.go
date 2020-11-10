@@ -35,7 +35,7 @@ import (
 
 // Sync implements vfs.FilesystemImpl.Sync.
 func (fs *filesystem) Sync(ctx context.Context) error {
-	// Snapshot current syncable dentries and special files.
+	// Snapshot current syncable dentries and special file FDs.
 	fs.syncMu.Lock()
 	ds := make([]*dentry, 0, len(fs.syncableDentries))
 	for d := range fs.syncableDentries {
@@ -53,22 +53,28 @@ func (fs *filesystem) Sync(ctx context.Context) error {
 	// regardless.
 	var retErr error
 
-	// Sync regular files.
+	// Sync syncable dentries.
 	for _, d := range ds {
-		err := d.syncCachedFile(ctx)
+		err := d.syncCachedFile(ctx, true /* forFilesystemSync */)
 		d.DecRef(ctx)
-		if err != nil && retErr == nil {
-			retErr = err
+		if err != nil {
+			ctx.Infof("gofer.filesystem.Sync: dentry.syncCachedFile failed: %v", err)
+			if retErr == nil {
+				retErr = err
+			}
 		}
 	}
 
 	// Sync special files, which may be writable but do not use dentry shared
 	// handles (so they won't be synced by the above).
 	for _, sffd := range sffds {
-		err := sffd.Sync(ctx)
+		err := sffd.sync(ctx, true /* forFilesystemSync */)
 		sffd.vfsfd.DecRef(ctx)
-		if err != nil && retErr == nil {
-			retErr = err
+		if err != nil {
+			ctx.Infof("gofer.filesystem.Sync: specialFileFD.sync failed: %v", err)
+			if retErr == nil {
+				retErr = err
+			}
 		}
 	}
 
@@ -229,7 +235,7 @@ func (fs *filesystem) revalidateChildLocked(ctx context.Context, vfsObj *vfs.Vir
 		return nil, err
 	}
 	if child != nil {
-		if !file.isNil() && inoFromPath(qid.Path) == child.ino {
+		if !file.isNil() && qid.Path == child.qidPath {
 			// The file at this path hasn't changed. Just update cached metadata.
 			file.close(ctx)
 			child.updateFromP9AttrsLocked(attrMask, &attr)
@@ -256,7 +262,7 @@ func (fs *filesystem) revalidateChildLocked(ctx context.Context, vfsObj *vfs.Vir
 			// treat their invalidation as deletion.
 			child.setDeleted()
 			parent.syntheticChildren--
-			child.decRefLocked()
+			child.decRefNoCaching()
 			parent.dirents = nil
 		}
 		*ds = appendDentry(*ds, child)
@@ -625,7 +631,7 @@ func (fs *filesystem) unlinkAt(ctx context.Context, rp *vfs.ResolvingPath, dir b
 		child.setDeleted()
 		if child.isSynthetic() {
 			parent.syntheticChildren--
-			child.decRefLocked()
+			child.decRefNoCaching()
 		}
 		ds = appendDentry(ds, child)
 	}
@@ -1026,7 +1032,7 @@ func (d *dentry) open(ctx context.Context, rp *vfs.ResolvingPath, opts *vfs.Open
 		// step is required even if !d.cachedMetadataAuthoritative() because
 		// d.mappings has to be updated.
 		// d.metadataMu has already been acquired if trunc == true.
-		d.updateFileSizeLocked(0)
+		d.updateSizeLocked(0)
 
 		if d.cachedMetadataAuthoritative() {
 			d.touchCMtimeLocked()
@@ -1311,6 +1317,9 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 			if !renamed.isDir() {
 				return syserror.EISDIR
 			}
+			if genericIsAncestorDentry(replaced, renamed) {
+				return syserror.ENOTEMPTY
+			}
 		} else {
 			if rp.MustBeDir() || renamed.isDir() {
 				return syserror.ENOTDIR
@@ -1352,7 +1361,7 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 		replaced.setDeleted()
 		if replaced.isSynthetic() {
 			newParent.syntheticChildren--
-			replaced.decRefLocked()
+			replaced.decRefNoCaching()
 		}
 		ds = appendDentry(ds, replaced)
 	}
@@ -1361,14 +1370,15 @@ func (fs *filesystem) RenameAt(ctx context.Context, rp *vfs.ResolvingPath, oldPa
 	// with reference counts and queue oldParent for checkCachingLocked if the
 	// parent isn't actually changing.
 	if oldParent != newParent {
+		oldParent.decRefNoCaching()
 		ds = appendDentry(ds, oldParent)
 		newParent.IncRef()
 		if renamed.isSynthetic() {
 			oldParent.syntheticChildren--
 			newParent.syntheticChildren++
 		}
+		renamed.parent = newParent
 	}
-	renamed.parent = newParent
 	renamed.name = newName
 	if newParent.children == nil {
 		newParent.children = make(map[string]*dentry)
@@ -1412,11 +1422,11 @@ func (fs *filesystem) SetStatAt(ctx context.Context, rp *vfs.ResolvingPath, opts
 		fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
 		return err
 	}
-	if err := d.setStat(ctx, rp.Credentials(), &opts, rp.Mount()); err != nil {
-		fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
+	err = d.setStat(ctx, rp.Credentials(), &opts, rp.Mount())
+	fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
+	if err != nil {
 		return err
 	}
-	fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
 
 	if ev := vfs.InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
 		d.InotifyWithParent(ctx, ev, 0, vfs.InodeEvent)
@@ -1491,7 +1501,7 @@ func (fs *filesystem) UnlinkAt(ctx context.Context, rp *vfs.ResolvingPath) error
 	return fs.unlinkAt(ctx, rp, false /* dir */)
 }
 
-// BoundEndpointAt implements FilesystemImpl.BoundEndpointAt.
+// BoundEndpointAt implements vfs.FilesystemImpl.BoundEndpointAt.
 func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.BoundEndpointOptions) (transport.BoundEndpoint, error) {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
@@ -1508,17 +1518,18 @@ func (fs *filesystem) BoundEndpointAt(ctx context.Context, rp *vfs.ResolvingPath
 			d.IncRef()
 			return &endpoint{
 				dentry: d,
-				file:   d.file.file,
 				path:   opts.Addr,
 			}, nil
 		}
-		return d.endpoint, nil
+		if d.endpoint != nil {
+			return d.endpoint, nil
+		}
 	}
 	return nil, syserror.ECONNREFUSED
 }
 
-// ListxattrAt implements vfs.FilesystemImpl.ListxattrAt.
-func (fs *filesystem) ListxattrAt(ctx context.Context, rp *vfs.ResolvingPath, size uint64) ([]string, error) {
+// ListXattrAt implements vfs.FilesystemImpl.ListXattrAt.
+func (fs *filesystem) ListXattrAt(ctx context.Context, rp *vfs.ResolvingPath, size uint64) ([]string, error) {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
 	defer fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
@@ -1526,11 +1537,11 @@ func (fs *filesystem) ListxattrAt(ctx context.Context, rp *vfs.ResolvingPath, si
 	if err != nil {
 		return nil, err
 	}
-	return d.listxattr(ctx, rp.Credentials(), size)
+	return d.listXattr(ctx, rp.Credentials(), size)
 }
 
-// GetxattrAt implements vfs.FilesystemImpl.GetxattrAt.
-func (fs *filesystem) GetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetxattrOptions) (string, error) {
+// GetXattrAt implements vfs.FilesystemImpl.GetXattrAt.
+func (fs *filesystem) GetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.GetXattrOptions) (string, error) {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
 	defer fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
@@ -1538,11 +1549,11 @@ func (fs *filesystem) GetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opt
 	if err != nil {
 		return "", err
 	}
-	return d.getxattr(ctx, rp.Credentials(), &opts)
+	return d.getXattr(ctx, rp.Credentials(), &opts)
 }
 
-// SetxattrAt implements vfs.FilesystemImpl.SetxattrAt.
-func (fs *filesystem) SetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetxattrOptions) error {
+// SetXattrAt implements vfs.FilesystemImpl.SetXattrAt.
+func (fs *filesystem) SetXattrAt(ctx context.Context, rp *vfs.ResolvingPath, opts vfs.SetXattrOptions) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
 	d, err := fs.resolveLocked(ctx, rp, &ds)
@@ -1550,18 +1561,18 @@ func (fs *filesystem) SetxattrAt(ctx context.Context, rp *vfs.ResolvingPath, opt
 		fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
 		return err
 	}
-	if err := d.setxattr(ctx, rp.Credentials(), &opts); err != nil {
-		fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
+	err = d.setXattr(ctx, rp.Credentials(), &opts)
+	fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
+	if err != nil {
 		return err
 	}
-	fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
 
 	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
 	return nil
 }
 
-// RemovexattrAt implements vfs.FilesystemImpl.RemovexattrAt.
-func (fs *filesystem) RemovexattrAt(ctx context.Context, rp *vfs.ResolvingPath, name string) error {
+// RemoveXattrAt implements vfs.FilesystemImpl.RemoveXattrAt.
+func (fs *filesystem) RemoveXattrAt(ctx context.Context, rp *vfs.ResolvingPath, name string) error {
 	var ds *[]*dentry
 	fs.renameMu.RLock()
 	d, err := fs.resolveLocked(ctx, rp, &ds)
@@ -1569,11 +1580,11 @@ func (fs *filesystem) RemovexattrAt(ctx context.Context, rp *vfs.ResolvingPath, 
 		fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
 		return err
 	}
-	if err := d.removexattr(ctx, rp.Credentials(), name); err != nil {
-		fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
+	err = d.removeXattr(ctx, rp.Credentials(), name)
+	fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
+	if err != nil {
 		return err
 	}
-	fs.renameMuRUnlockAndCheckCaching(ctx, &ds)
 
 	d.InotifyWithParent(ctx, linux.IN_ATTRIB, 0, vfs.InodeEvent)
 	return nil
@@ -1584,8 +1595,4 @@ func (fs *filesystem) PrependPath(ctx context.Context, vfsroot, vd vfs.VirtualDe
 	fs.renameMu.RLock()
 	defer fs.renameMu.RUnlock()
 	return genericPrependPath(vfsroot, vd.Mount(), vd.Dentry().Impl().(*dentry), b)
-}
-
-func (fs *filesystem) nextSyntheticIno() inodeNumber {
-	return inodeNumber(atomic.AddUint64(&fs.syntheticSeq, 1) | syntheticInoMask)
 }

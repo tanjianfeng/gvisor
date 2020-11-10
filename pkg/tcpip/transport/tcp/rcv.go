@@ -43,26 +43,32 @@ type receiver struct {
 	// rcvWnd is the non-scaled receive window last advertised to the peer.
 	rcvWnd seqnum.Size
 
+	// rcvWUP is the rcvNxt value at the last window update sent.
+	rcvWUP seqnum.Value
+
 	rcvWndScale uint8
 
 	closed bool
 
+	// pendingRcvdSegments is bounded by the receive buffer size of the
+	// endpoint.
 	pendingRcvdSegments segmentHeap
-	pendingBufUsed      seqnum.Size
-	pendingBufSize      seqnum.Size
+	// pendingBufUsed tracks the total number of bytes (including segment
+	// overhead) currently queued in pendingRcvdSegments.
+	pendingBufUsed int
 
 	// Time when the last ack was received.
 	lastRcvdAckTime time.Time `state:".(unixTime)"`
 }
 
-func newReceiver(ep *endpoint, irs seqnum.Value, rcvWnd seqnum.Size, rcvWndScale uint8, pendingBufSize seqnum.Size) *receiver {
+func newReceiver(ep *endpoint, irs seqnum.Value, rcvWnd seqnum.Size, rcvWndScale uint8) *receiver {
 	return &receiver{
 		ep:              ep,
 		rcvNxt:          irs + 1,
 		rcvAcc:          irs.Add(rcvWnd + 1),
 		rcvWnd:          rcvWnd,
+		rcvWUP:          irs + 1,
 		rcvWndScale:     rcvWndScale,
-		pendingBufSize:  pendingBufSize,
 		lastRcvdAckTime: time.Now(),
 	}
 }
@@ -82,19 +88,54 @@ func (r *receiver) acceptable(segSeq seqnum.Value, segLen seqnum.Size) bool {
 	return header.Acceptable(segSeq, segLen, r.rcvNxt, r.rcvNxt.Add(advertisedWindowSize))
 }
 
+// currentWindow returns the available space in the window that was advertised
+// last to our peer.
+func (r *receiver) currentWindow() (curWnd seqnum.Size) {
+	endOfWnd := r.rcvWUP.Add(r.rcvWnd)
+	if endOfWnd.LessThan(r.rcvNxt) {
+		// return 0 if r.rcvNxt is past the end of the previously advertised window.
+		// This can happen because we accept a large segment completely even if
+		// accepting it causes it to partially exceed the advertised window.
+		return 0
+	}
+	return r.rcvNxt.Size(endOfWnd)
+}
+
 // getSendParams returns the parameters needed by the sender when building
 // segments to send.
 func (r *receiver) getSendParams() (rcvNxt seqnum.Value, rcvWnd seqnum.Size) {
-	// Calculate the window size based on the available buffer space.
-	receiveBufferAvailable := r.ep.receiveBufferAvailable()
-	acc := r.rcvNxt.Add(seqnum.Size(receiveBufferAvailable))
-	if r.rcvAcc.LessThan(acc) {
-		r.rcvAcc = acc
+	newWnd := r.ep.selectWindow()
+	curWnd := r.currentWindow()
+	// Update rcvAcc only if new window is > previously advertised window. We
+	// should never shrink the acceptable sequence space once it has been
+	// advertised the peer. If we shrink the acceptable sequence space then we
+	// would end up dropping bytes that might already be in flight.
+	// ====================================================  sequence space.
+	// ^             ^               ^                   ^
+	// rcvWUP       rcvNxt         rcvAcc          new rcvAcc
+	//               <=====curWnd ===>
+	//               <========= newWnd > curWnd ========= >
+	if r.rcvNxt.Add(seqnum.Size(curWnd)).LessThan(r.rcvNxt.Add(seqnum.Size(newWnd))) {
+		// If the new window moves the right edge, then update rcvAcc.
+		r.rcvAcc = r.rcvNxt.Add(seqnum.Size(newWnd))
+	} else {
+		if newWnd == 0 {
+			// newWnd is zero but we can't advertise a zero as it would cause window
+			// to shrink so just increment a metric to record this event.
+			r.ep.stats.ReceiveErrors.WantZeroRcvWindow.Increment()
+		}
+		newWnd = curWnd
 	}
 	// Stash away the non-scaled receive window as we use it for measuring
 	// receiver's estimated RTT.
-	r.rcvWnd = r.rcvNxt.Size(r.rcvAcc)
-	return r.rcvNxt, r.rcvWnd >> r.rcvWndScale
+	r.rcvWnd = newWnd
+	r.rcvWUP = r.rcvNxt
+	scaledWnd := r.rcvWnd >> r.rcvWndScale
+	if scaledWnd == 0 {
+		// Increment a metric if we are advertising an actual zero window.
+		r.ep.stats.ReceiveErrors.ZeroRcvWindowState.Increment()
+	}
+	return r.rcvNxt, scaledWnd
 }
 
 // nonZeroWindow is called when the receive window grows from zero to nonzero;
@@ -195,7 +236,9 @@ func (r *receiver) consumeSegment(s *segment, segSeq seqnum.Value, segLen seqnum
 		}
 
 		for i := first; i < len(r.pendingRcvdSegments); i++ {
+			r.pendingBufUsed -= r.pendingRcvdSegments[i].segMemSize()
 			r.pendingRcvdSegments[i].decRef()
+
 			// Note that slice truncation does not allow garbage collection of
 			// truncated items, thus truncated items must be set to nil to avoid
 			// memory leaks.
@@ -268,14 +311,7 @@ func (r *receiver) handleRcvdSegmentClosing(s *segment, state EndpointState, clo
 	// If we are in one of the shutdown states then we need to do
 	// additional checks before we try and process the segment.
 	switch state {
-	case StateCloseWait:
-		// If the ACK acks something not yet sent then we send an ACK.
-		if r.ep.snd.sndNxt.LessThan(s.ackNumber) {
-			r.ep.snd.sendAck()
-			return true, nil
-		}
-		fallthrough
-	case StateClosing, StateLastAck:
+	case StateCloseWait, StateClosing, StateLastAck:
 		if !s.sequenceNumber.LessThanEq(r.rcvNxt) {
 			// Just drop the segment as we have
 			// already received a FIN and this
@@ -284,9 +320,31 @@ func (r *receiver) handleRcvdSegmentClosing(s *segment, state EndpointState, clo
 			return true, nil
 		}
 		fallthrough
-	case StateFinWait1:
-		fallthrough
-	case StateFinWait2:
+	case StateFinWait1, StateFinWait2:
+		// If the ACK acks something not yet sent then we send an ACK.
+		//
+		// RFC793, page 37: If the connection is in a synchronized state,
+		// (ESTABLISHED, FIN-WAIT-1, FIN-WAIT-2, CLOSE-WAIT, CLOSING, LAST-ACK,
+		// TIME-WAIT), any unacceptable segment (out of window sequence number
+		// or unacceptable acknowledgment number) must elicit only an empty
+		// acknowledgment segment containing the current send-sequence number
+		// and an acknowledgment indicating the next sequence number expected
+		// to be received, and the connection remains in the same state.
+		//
+		// Just as on Linux, we do not apply this behavior when state is
+		// ESTABLISHED.
+		// Linux receive processing for all states except ESTABLISHED and
+		// TIME_WAIT is here where if the ACK check fails, we attempt to
+		// reply back with an ACK with correct seq/ack numbers.
+		// https://github.com/torvalds/linux/blob/v5.8/net/ipv4/tcp_input.c#L6186
+		// The ESTABLISHED state processing is here where if the ACK check
+		// fails, we ignore the packet:
+		// https://github.com/torvalds/linux/blob/v5.8/net/ipv4/tcp_input.c#L5591
+		if r.ep.snd.sndNxt.LessThan(s.ackNumber) {
+			r.ep.snd.sendAck()
+			return true, nil
+		}
+
 		// If we are closed for reads (either due to an
 		// incoming FIN or the user calling shutdown(..,
 		// SHUT_RD) then any data past the rcvNxt should
@@ -369,10 +427,16 @@ func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err *tcpip.Error) {
 	// Defer segment processing if it can't be consumed now.
 	if !r.consumeSegment(s, segSeq, segLen) {
 		if segLen > 0 || s.flagIsSet(header.TCPFlagFin) {
-			// We only store the segment if it's within our buffer
-			// size limit.
-			if r.pendingBufUsed < r.pendingBufSize {
-				r.pendingBufUsed += seqnum.Size(s.segMemSize())
+			// We only store the segment if it's within our buffer size limit.
+			//
+			// Only use 75% of the receive buffer queue for out-of-order
+			// segments. This ensures that we always leave some space for the inorder
+			// segments to arrive allowing pending segments to be processed and
+			// delivered to the user.
+			if r.ep.receiveBufferAvailable() > 0 && r.pendingBufUsed < r.ep.receiveBufferSize()>>2 {
+				r.ep.rcvListMu.Lock()
+				r.pendingBufUsed += s.segMemSize()
+				r.ep.rcvListMu.Unlock()
 				s.incRef()
 				heap.Push(&r.pendingRcvdSegments, s)
 				UpdateSACKBlocks(&r.ep.sack, segSeq, segSeq.Add(segLen), r.rcvNxt)
@@ -406,7 +470,9 @@ func (r *receiver) handleRcvdSegment(s *segment) (drop bool, err *tcpip.Error) {
 		}
 
 		heap.Pop(&r.pendingRcvdSegments)
-		r.pendingBufUsed -= seqnum.Size(s.segMemSize())
+		r.ep.rcvListMu.Lock()
+		r.pendingBufUsed -= s.segMemSize()
+		r.ep.rcvListMu.Unlock()
 		s.decRef()
 	}
 	return false, nil
@@ -421,6 +487,13 @@ func (r *receiver) handleTimeWaitSegment(s *segment) (resetTimeWait bool, newSyn
 	// Just silently drop any RST packets in TIME_WAIT. We do not support
 	// TIME_WAIT assasination as a result we confirm w/ fix 1 as described
 	// in https://tools.ietf.org/html/rfc1337#section-3.
+	//
+	// This behavior overrides RFC793 page 70 where we transition to CLOSED
+	// on receiving RST, which is also default Linux behavior.
+	// On Linux the RST can be ignored by setting sysctl net.ipv4.tcp_rfc1337.
+	//
+	// As we do not yet support PAWS, we are being conservative in ignoring
+	// RSTs by default.
 	if s.flagIsSet(header.TCPFlagRst) {
 		return false, false
 	}
